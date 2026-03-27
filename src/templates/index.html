@@ -53,10 +53,14 @@
   <div class="tabs" id="tabs">
     <button class="tab active" data-tab="dashboard">Dashboard</button>
     <button class="tab" data-tab="errors">Error Log <span class="tab-badge hidden" id="error-badge">0</span></button>
+    <button class="tab" data-tab="settings">Settings</button>
   </div>
 
   <!-- Dashboard Tab -->
   <div id="tab-dashboard" class="tab-content active">
+    <div style="display:flex;gap:8px;margin-bottom:12px;">
+      <a href="/api/export/monitoring.csv" class="btn btn-sm" download>↓ Export Snapshot CSV</a>
+    </div>
     <div id="devices-container">
       <div class="section" style="text-align:center;padding:40px;">
         <p class="color-muted">No devices configured.</p>
@@ -68,9 +72,63 @@
   <!-- Error Log Tab -->
   <div id="tab-errors" class="tab-content">
     <div class="section">
-      <div class="section-title">Error Log</div>
+      <div class="section-title">
+        Error Log
+        <span class="badge badge-danger" id="active-error-count">0 active</span>
+        <div style="margin-left:auto;display:flex;gap:6px;">
+          <a href="/api/export/errors.csv" class="btn btn-sm" download>↓ Export CSV</a>
+          <button class="btn btn-sm" onclick="clearResolved()">Clear Resolved</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+        <div class="filter-pills" id="severity-filter">
+          <button class="pill active" data-val="ALL">All</button>
+          <button class="pill" data-val="CRITICAL">Critical</button>
+          <button class="pill" data-val="WARNING">Warning</button>
+          <button class="pill" data-val="INFO">Info</button>
+        </div>
+        <div class="filter-pills" id="status-filter">
+          <button class="pill active" data-val="ALL">All</button>
+          <button class="pill" data-val="ACTIVE">Active</button>
+          <button class="pill" data-val="RESOLVED">Resolved</button>
+        </div>
+      </div>
       <div id="error-log" style="max-height:500px;overflow-y:auto;">
         <p class="color-muted" style="padding:20px;text-align:center;">No errors recorded</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Tab -->
+  <div id="tab-settings" class="tab-content">
+    <div class="section">
+      <div class="section-title">Alert Thresholds</div>
+      <div class="info-grid" style="max-width:500px;">
+        <div class="info-item">
+          <label>Temperature Warning (°C)</label>
+          <input type="number" id="set-temp-warn" class="input" step="1" value="60">
+        </div>
+        <div class="info-item">
+          <label>Temperature Critical (°C)</label>
+          <input type="number" id="set-temp-crit" class="input" step="1" value="75">
+        </div>
+        <div class="info-item">
+          <label>Minimum Voltage (V)</label>
+          <input type="number" id="set-volt-min" class="input" step="0.1" value="4.7">
+        </div>
+        <div class="info-item">
+          <label>Poll Interval (seconds)</label>
+          <input type="number" id="set-poll-int" class="input" step="0.5" min="1" max="30" value="2">
+        </div>
+      </div>
+      <button class="btn btn-primary" style="margin-top:12px;" onclick="saveSettings()">Save Settings</button>
+      <span id="settings-saved" class="color-success" style="margin-left:10px;font-size:12px;display:none;">Saved ✓</span>
+    </div>
+    <div class="section">
+      <div class="section-title">About</div>
+      <div class="info-grid" style="max-width:500px;">
+        <div class="info-item"><div class="info-label">Version</div><div class="info-value" id="app-version">—</div></div>
+        <div class="info-item"><div class="info-label">Protocol</div><div class="info-value">NovaStar TCP/5200</div></div>
       </div>
     </div>
   </div>

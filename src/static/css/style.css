@@ -163,3 +163,26 @@ label { font-size:11px; color:var(--muted); display:block; margin-bottom:4px; fo
 ::-webkit-scrollbar { width:6px; }
 ::-webkit-scrollbar-track { background:var(--bg); }
 ::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+/* ── Filter Pills ── */
+.filter-pills { display:flex; gap:0; border-radius:6px; overflow:hidden; border:1px solid var(--border); }
+.pill {
+  padding:4px 10px; font-size:10px; font-weight:600; border:none; cursor:pointer;
+  background:var(--bg); color:var(--muted); transition:all 0.15s; font-family:inherit;
+}
+.pill.active { background:var(--primary); color:#fff; }
+.pill:hover:not(.active) { color:var(--text); }
+
+/* ── Error Entry Actions ── */
+.error-actions { display:flex; gap:4px; margin-top:4px; }
+.error-actions .btn { padding:2px 8px; font-size:10px; }
+.error-resolved { opacity:0.5; }
+
+/* ── Connection Lost Overlay ── */
+.connection-lost {
+  position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+  background:var(--danger); color:#fff; padding:10px 24px; border-radius:8px;
+  font-size:13px; font-weight:600; z-index:300; display:none;
+  box-shadow:0 4px 20px rgba(239,68,68,0.4);
+}
+.connection-lost.visible { display:block; }
