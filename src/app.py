@@ -337,18 +337,39 @@ def api_update_settings():
     return jsonify({"status": "saved"})
 
 
-@app.route('/api/demo', methods=['POST'])
-def api_add_demo():
-    """Add a demo device for offline UI testing."""
+@app.route('/api/demo', methods=['GET'])
+def api_demo_status():
+    """Check if simulation mode is active."""
     from demo_device import DemoDevice
-    demo = DemoDevice()
-    if demo.device_id in manager.devices:
-        return jsonify({"error": "Demo device already active"}), 409
-    manager.devices[demo.device_id] = demo
-    if manager._running:
-        manager._start_device_thread(demo.device_id)
-    log_event('demo_device_added')
-    return jsonify({"status": "added", "device_id": demo.device_id})
+    active = DemoDevice.DEVICE_ID in manager.devices
+    return jsonify({"active": active})
+
+
+@app.route('/api/demo', methods=['POST'])
+def api_demo_toggle():
+    """Enable or disable simulation mode."""
+    from demo_device import DemoDevice
+    data = request.get_json(silent=True) or {}
+    enable = data.get('enable', True)
+
+    if enable:
+        if DemoDevice.DEVICE_ID in manager.devices:
+            return jsonify({"active": True, "status": "already_active"})
+        demo = DemoDevice()
+        manager.devices[demo.device_id] = demo
+        if manager._running:
+            manager._start_device_thread(demo.device_id)
+        log_event('simulation_enabled')
+        logger.info('Simulation mode enabled')
+        return jsonify({"active": True, "status": "enabled"})
+    else:
+        if DemoDevice.DEVICE_ID not in manager.devices:
+            return jsonify({"active": False, "status": "already_inactive"})
+        manager.devices[DemoDevice.DEVICE_ID].disconnect()
+        del manager.devices[DemoDevice.DEVICE_ID]
+        log_event('simulation_disabled')
+        logger.info('Simulation mode disabled')
+        return jsonify({"active": False, "status": "disabled"})
 
 
 @app.route('/api/version', methods=['GET'])
