@@ -10,10 +10,6 @@ on:
       version:
         description: "Version number (e.g. 0.2.0)"
         required: true
-      branch:
-        description: "Branch to build from (default: main)"
-        required: false
-        default: "main"
 
 permissions:
   contents: read
