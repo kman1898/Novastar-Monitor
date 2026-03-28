@@ -1,6 +1,6 @@
 # NovaStar Monitor
 
-**Version 0.2.0**
+**Version 0.3.0**
 
 A real-time monitoring dashboard for NovaStar LED video processing systems. Connects directly to NovaStar controllers (VX1000, MCTRL660, and compatible) via their binary TCP protocol on port 5200, providing live visibility into temperature, voltage, receiving card status, link redundancy, and more.
 
@@ -102,6 +102,13 @@ src/
 - Close NovaLCT/SmartLCT before connecting (can't share TCP connection)
 
 ## Changelog
+
+### v0.3.0
+- Simulation mode: toggle a simulated VX1000 (14 cards) from Settings, system tray, or CLI (`--demo`)
+- Structured JSON logging with rotation (20 MB, 2 backups), event/request/error logging
+- Fix release workflow: `workflow_dispatch` now creates a proper tag for GitHub releases
+- Fix receiving card online/offline status display in dashboard
+- Test suite expanded to 70 tests
 
 ### v0.2.0
 - Per-card monitoring via direct receiving card addressing (confirmed from VX1000 Wireshark captures)
