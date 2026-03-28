@@ -10,6 +10,10 @@ on:
       version:
         description: "Version number (e.g. 0.2.0)"
         required: true
+      branch:
+        description: "Branch to build from (default: main)"
+        required: false
+        default: "main"
 
 permissions:
   contents: read
@@ -186,7 +190,7 @@ jobs:
     name: Create Release
     needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
     steps:
