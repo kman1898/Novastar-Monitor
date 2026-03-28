@@ -192,6 +192,26 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Determine version and tag
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+            TAG="v${VERSION}"
+          else
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}, tag: ${TAG}"
+
+      - name: Create tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v6
         with:
@@ -206,7 +226,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "NovaStar Monitor ${{ github.ref_name }}"
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "NovaStar Monitor ${{ steps.version.outputs.tag }}"
           draft: true
           generate_release_notes: true
           files: |

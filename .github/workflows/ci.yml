@@ -53,9 +53,9 @@ jobs:
         run: |
           source .venv/bin/activate
           # Fatal errors (syntax, undefined names) — must pass
-          flake8 src/app.py src/device_manager.py src/novastar_protocol.py src/launcher_settings.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 src/app.py src/device_manager.py src/novastar_protocol.py src/launcher_settings.py src/demo_device.py --count --select=E9,F63,F7,F82 --show-source --statistics
           # Style warnings — advisory
-          flake8 src/app.py src/device_manager.py src/novastar_protocol.py --count --exit-zero --max-complexity=15 --max-line-length=150 --statistics
+          flake8 src/app.py src/device_manager.py src/novastar_protocol.py src/demo_device.py --count --exit-zero --max-complexity=15 --max-line-length=150 --statistics
 
   test:
     name: Test (${{ matrix.os }})
@@ -118,7 +118,7 @@ jobs:
       - name: Verify all source files referenced in spec exist
         run: |
           echo "=== Checking PyInstaller spec file references ==="
-          for f in launcher_mac.py launcher_pc.py app.py device_manager.py novastar_protocol.py launcher_settings.py; do
+          for f in launcher_mac.py launcher_pc.py app.py device_manager.py novastar_protocol.py launcher_settings.py demo_device.py; do
             if [ ! -f "src/$f" ]; then
               echo "FAIL: src/$f referenced in spec but does not exist!"
               exit 1
