@@ -1,4 +1,7 @@
 /* NovaStar Monitor — Frontend Application */
+/* exported showAddDevice, addDevice, removeDevice, toggleDevice,
+   saveSettings, resolveError, acknowledgeError, clearResolved,
+   toggleSimulation */
 
 // ── State ──
 let socket;
