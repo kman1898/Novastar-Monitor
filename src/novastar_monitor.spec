@@ -78,8 +78,8 @@ if system == 'Darwin':
         info_plist={
             'CFBundleName': 'NovaStar Monitor',
             'CFBundleDisplayName': 'NovaStar Monitor',
-            'CFBundleVersion': '0.1.0',
-            'CFBundleShortVersionString': '0.1.0',
+            'CFBundleVersion': '0.2.0',
+            'CFBundleShortVersionString': '0.2.0',
             'LSUIElement': True,  # Hide from Dock (menu bar app)
         },
     )
