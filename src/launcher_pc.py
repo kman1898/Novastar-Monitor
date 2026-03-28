@@ -7,6 +7,7 @@ import os
 import threading
 import webbrowser
 import time
+import json
 
 # Resolve paths for PyInstaller bundle
 if getattr(sys, 'frozen', False):
@@ -29,7 +30,13 @@ def start_flask_server(settings):
     host = settings.get('interface', '127.0.0.1')
     port = int(settings.get('port', 8050))
 
-    from app import app, socketio
+    from app import app, socketio, log_event
+    log_event('launcher_start', {
+        'platform': 'pc',
+        'host': host,
+        'port': port,
+        'log_dir': os.environ.get('_NSM_LOG_DIR', 'unknown'),
+    })
     print(f'[NovaStar Monitor] Server starting on {host}:{port}')
     socketio.run(app, host=host, port=port, debug=False,
                  allow_unsafe_werkzeug=True)
@@ -114,6 +121,25 @@ def run_tray(settings):
     def auto_browser_checked(item):
         return settings.get('auto_open_browser', True)
 
+    _sim_active = [False]
+
+    def toggle_simulation(icon, item):
+        import urllib.request
+        enable = not _sim_active[0]
+        url = f'http://127.0.0.1:{port}/api/demo'
+        data = json.dumps({'enable': enable}).encode()
+        req = urllib.request.Request(url, data=data,
+                                     headers={'Content-Type': 'application/json'})
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            result = json.loads(resp.read())
+            _sim_active[0] = result.get('active', False)
+        except Exception:
+            pass
+
+    def simulation_checked(item):
+        return _sim_active[0]
+
     icon = pystray.Icon(
         name='NovaStar Monitor',
         icon=create_tray_icon_image(),
@@ -126,6 +152,8 @@ def run_tray(settings):
             Menu.SEPARATOR,
             MenuItem(f'Running on {display_host}:{port}', None, enabled=False),
             Menu.SEPARATOR,
+            MenuItem('Simulation Mode', toggle_simulation,
+                     checked=simulation_checked),
             MenuItem('Open Browser on Launch', toggle_auto_browser,
                      checked=auto_browser_checked),
             MenuItem('Run at Login', toggle_run_at_login,

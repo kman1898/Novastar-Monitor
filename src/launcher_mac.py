@@ -27,7 +27,13 @@ from launcher_settings import load_settings, save_settings, get_network_interfac
 def start_flask_server(settings):
     host = settings.get('interface', '127.0.0.1')
     port = int(settings.get('port', 8050))
-    from app import app, socketio
+    from app import app, socketio, log_event
+    log_event('launcher_start', {
+        'platform': 'macos',
+        'host': host,
+        'port': port,
+        'log_dir': os.environ.get('_NSM_LOG_DIR', 'unknown'),
+    })
     print(f'[NovaStar Monitor] Server starting on {host}:{port}')
     socketio.run(app, host=host, port=port, debug=False,
                  allow_unsafe_werkzeug=True)
@@ -53,14 +59,32 @@ def main():
     # Try rumps (native macOS), fall back to pystray
     try:
         import rumps
+        import json
+        import urllib.request
 
         class NovaStarMonitorApp(rumps.App):
             def __init__(self):
-                super().__init__('NovaStar Monitor', title='N★')
+                super().__init__('NovaStar Monitor', title='N\u2605')
+                self._sim_item = rumps.MenuItem('Simulation Mode')
 
             @rumps.clicked('Open Dashboard')
             def open_dashboard(self, _):
                 webbrowser.open(get_display_url(settings))
+
+            @rumps.clicked('Simulation Mode')
+            def toggle_simulation(self, sender):
+                enable = not sender.state
+                port = settings.get('port', 8050)
+                url = f'http://127.0.0.1:{port}/api/demo'
+                data = json.dumps({'enable': enable}).encode()
+                req = urllib.request.Request(url, data=data,
+                                             headers={'Content-Type': 'application/json'})
+                try:
+                    resp = urllib.request.urlopen(req, timeout=5)
+                    result = json.loads(resp.read())
+                    sender.state = result.get('active', False)
+                except Exception:
+                    pass
 
             @rumps.clicked('Quit')
             def quit_app(self, _):

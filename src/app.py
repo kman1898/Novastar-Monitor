@@ -10,6 +10,8 @@ import os
 import sys
 import time
 import threading
+import logging
+import traceback
 from datetime import datetime
 
 # Support PyInstaller bundle
@@ -18,22 +20,126 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# App directory (writable, for logs/settings)
+if getattr(sys, 'frozen', False):
+    _APP_DIR = os.path.dirname(sys.executable)
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── Logging Setup ─────────────────────────────────────────
+LOG_DIR_PATH = os.path.join(_APP_DIR, 'logs')
+LOG_FILE_PATH = os.path.join(LOG_DIR_PATH, 'novastar_monitor.log')
+LOG_MAX_BYTES = 20 * 1024 * 1024   # 20 MB max file size
+LOG_BACKUPS = 2                     # Keep 2 backup rotations
+os.environ['_NSM_LOG_DIR'] = LOG_DIR_PATH
+os.makedirs(LOG_DIR_PATH, exist_ok=True)
+print(f'[NovaStar Monitor] Log directory: {LOG_DIR_PATH}')
+
+
+def rotate_logs():
+    """Rotate log file if it exceeds LOG_MAX_BYTES."""
+    try:
+        if os.path.exists(LOG_FILE_PATH) and os.path.getsize(LOG_FILE_PATH) > LOG_MAX_BYTES:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup = os.path.join(LOG_DIR_PATH, f'novastar_monitor_{ts}.log')
+            os.rename(LOG_FILE_PATH, backup)
+            prune_log_files()
+    except Exception:
+        pass
+
+
+def prune_log_files():
+    """Keep only LOG_BACKUPS most recent backup log files."""
+    try:
+        backups = sorted(
+            [f for f in os.listdir(LOG_DIR_PATH)
+             if f.startswith('novastar_monitor_') and f.endswith('.log')],
+            reverse=True
+        )
+        for old in backups[LOG_BACKUPS:]:
+            os.remove(os.path.join(LOG_DIR_PATH, old))
+    except Exception:
+        pass
+
+
+def log_event(action, details=None, source='server'):
+    """Write a structured JSON event to the log file."""
+    rotate_logs()
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    payload = {
+        'timestamp': ts,
+        'source': source,
+        'action': action,
+        'details': details,
+    }
+    try:
+        with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+logger = logging.getLogger('novastar_monitor')
+logger.setLevel(logging.DEBUG)
+
+# Console handler
+_ch = logging.StreamHandler()
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(logging.Formatter('[NovaStar Monitor] %(levelname)s — %(message)s'))
+logger.addHandler(_ch)
+
+
 app = Flask(__name__,
             template_folder=os.path.join(BASE_DIR, 'templates'),
             static_folder=os.path.join(BASE_DIR, 'static'))
 app.config['SECRET_KEY'] = 'novastar-monitor-secret'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# Settings file location
-if getattr(sys, 'frozen', False):
-    APP_DIR = os.path.dirname(sys.executable)
-else:
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
+APP_DIR = _APP_DIR
 SETTINGS_FILE = os.path.join(APP_DIR, 'novastar_settings.json')
+
+# ── Request / Error Logging Hooks ─────────────────────────
+
+@app.before_request
+def _log_request():
+    """Log incoming HTTP requests (skip static assets and log endpoint)."""
+    if request.path.startswith('/static') or request.path == '/api/log':
+        return
+    if request.path == '/':
+        log_event('http_request', {
+            'method': request.method,
+            'path': request.path,
+            'remote_addr': request.remote_addr,
+        })
+
+
+@app.errorhandler(Exception)
+def _handle_error(e):
+    """Log unhandled exceptions."""
+    logger.error('Unhandled exception: %s', e)
+    log_event('unhandled_error', {
+        'error': str(e),
+        'type': type(e).__name__,
+        'path': request.path,
+        'method': request.method,
+        'traceback': traceback.format_exc(),
+    })
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/log', methods=['POST'])
+def api_client_log():
+    """Accept log events from the browser client."""
+    data = request.get_json(silent=True) or {}
+    log_event(data.get('action', 'client_event'), data.get('details'), source='client')
+    return jsonify({'status': 'ok'})
+
 
 # Import device manager
 from device_manager import DeviceManager
+
+# Demo mode flag — set via --demo CLI arg or /api/demo endpoint
+DEMO_MODE = '--demo' in sys.argv
 
 # Global device manager instance
 manager = DeviceManager(poll_interval=2.0)
@@ -64,7 +170,7 @@ def save_settings(settings):
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=2)
     except Exception as e:
-        print(f"[NovaStar Monitor] Failed to save settings: {e}")
+        logger.error('Failed to save settings: %s', e)
 
 
 # ── SocketIO Events ──────────────────────────────────────
@@ -231,6 +337,41 @@ def api_update_settings():
     return jsonify({"status": "saved"})
 
 
+@app.route('/api/demo', methods=['GET'])
+def api_demo_status():
+    """Check if simulation mode is active."""
+    from demo_device import DemoDevice
+    active = DemoDevice.DEVICE_ID in manager.devices
+    return jsonify({"active": active})
+
+
+@app.route('/api/demo', methods=['POST'])
+def api_demo_toggle():
+    """Enable or disable simulation mode."""
+    from demo_device import DemoDevice
+    data = request.get_json(silent=True) or {}
+    enable = data.get('enable', True)
+
+    if enable:
+        if DemoDevice.DEVICE_ID in manager.devices:
+            return jsonify({"active": True, "status": "already_active"})
+        demo = DemoDevice()
+        manager.devices[demo.device_id] = demo
+        if manager._running:
+            manager._start_device_thread(demo.device_id)
+        log_event('simulation_enabled')
+        logger.info('Simulation mode enabled')
+        return jsonify({"active": True, "status": "enabled"})
+    else:
+        if DemoDevice.DEVICE_ID not in manager.devices:
+            return jsonify({"active": False, "status": "already_inactive"})
+        manager.devices[DemoDevice.DEVICE_ID].disconnect()
+        del manager.devices[DemoDevice.DEVICE_ID]
+        log_event('simulation_disabled')
+        logger.info('Simulation mode disabled')
+        return jsonify({"active": False, "status": "disabled"})
+
+
 @app.route('/api/version', methods=['GET'])
 def api_version():
     version_file = os.path.join(BASE_DIR, 'VERSION.txt')
@@ -266,7 +407,7 @@ def save_error_log():
         with open(ERROR_LOG_FILE, 'w') as f:
             json.dump(_error_log[-MAX_ERROR_LOG:], f, indent=2)
     except Exception as e:
-        print(f"[NovaStar Monitor] Failed to save error log: {e}")
+        logger.error('Failed to save error log: %s', e)
 
 
 def add_error(severity, device, message, cabinet=None, port=None, value=None):
@@ -287,6 +428,7 @@ def add_error(severity, device, message, cabinet=None, port=None, value=None):
     _error_log.append(entry)
     save_error_log()
     socketio.emit('alert', entry)
+    log_event('alert', {'severity': severity, 'device': device, 'message': message})
     return entry
 
 
@@ -416,7 +558,7 @@ def api_export_monitoring_csv():
 def init_devices():
     """Load saved devices, error log, and start polling."""
     load_error_log()
-    print(f"[NovaStar Monitor] Loaded {len(_error_log)} error log entries")
+    logger.info('Loaded %d error log entries', len(_error_log))
 
     settings = load_settings()
     for dev_conf in settings.get('devices', []):
@@ -428,11 +570,25 @@ def init_devices():
                 dev_conf.get('port', 5200),
             )
         except Exception as e:
-            print(f"[NovaStar Monitor] Failed to add device {dev_conf.get('ip')}: {e}")
+            logger.error('Failed to add device %s: %s', dev_conf.get('ip'), e)
+
+    # Auto-add demo device if --demo flag is set
+    if DEMO_MODE:
+        from demo_device import DemoDevice
+        demo = DemoDevice()
+        manager.devices[demo.device_id] = demo
+        logger.info('Demo mode: added simulated VX1000 device')
 
     manager.poll_interval = settings.get('poll_interval', 2.0)
     manager.start()
-    print(f"[NovaStar Monitor] Started monitoring {len(manager.devices)} device(s)")
+    logger.info('Started monitoring %d device(s)%s', len(manager.devices),
+                ' (DEMO MODE)' if DEMO_MODE else '')
+    log_event('server_start', {
+        'device_count': len(manager.devices),
+        'poll_interval': manager.poll_interval,
+        'log_dir': LOG_DIR_PATH,
+        'demo_mode': DEMO_MODE,
+    })
 
 
 # Initialize on import (but not on reload)
@@ -443,6 +599,6 @@ if not _initialized:
 
 
 if __name__ == '__main__':
-    print("[NovaStar Monitor] Starting server on http://127.0.0.1:8050")
+    logger.info('Starting server on http://127.0.0.1:8050')
     socketio.run(app, host='127.0.0.1', port=8050, debug=True,
                  allow_unsafe_werkzeug=True)

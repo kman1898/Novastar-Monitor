@@ -272,11 +272,11 @@ function renderDevicePanel(dev) {
           <div class="section-title">📦 Receiving Cards <span class="badge badge-info">${cards.length} total</span></div>
           <div class="card-grid">
             ${cards.map(c => `
-              <div class="card-tile ${c.has_data ? 'active' : 'offline'}">
+              <div class="card-tile ${c.online ? 'active' : 'offline'}">
                 <div class="card-id">${c.label}</div>
                 <div class="card-status">
-                  <span class="status-dot" style="background:var(--${c.has_data ? 'success' : 'danger'})"></span>
-                  ${c.has_data ? 'Online' : 'Offline'}
+                  <span class="status-dot" style="background:var(--${c.online ? 'success' : 'danger'})"></span>
+                  ${c.online ? 'Online' : 'Offline'}
                 </div>
               </div>
             `).join('')}
@@ -555,8 +555,47 @@ function infoItem(label, value, colorClass) {
   </div>`;
 }
 
+// ── Simulation Mode ──
+function toggleSimulation(enable) {
+  fetch('/api/demo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enable }),
+  })
+  .then(r => r.json())
+  .then(data => {
+    updateDemoStatus(data.active);
+    if (!data.active) {
+      // Remove demo device from local state
+      delete devices['demo-vx1000'];
+      renderAll();
+    }
+  })
+  .catch(err => {
+    alert('Failed to toggle simulation: ' + err);
+    // Revert checkbox
+    const toggle = document.getElementById('demo-toggle');
+    if (toggle) toggle.checked = !enable;
+  });
+}
+
+function updateDemoStatus(active) {
+  const toggle = document.getElementById('demo-toggle');
+  const status = document.getElementById('demo-status');
+  if (toggle) toggle.checked = active;
+  if (status) {
+    status.textContent = active ? 'Active — Demo VX1000' : 'Disabled';
+    status.style.color = active ? 'var(--success)' : 'var(--muted)';
+  }
+}
+
+function checkDemoStatus() {
+  fetch('/api/demo').then(r => r.json()).then(data => updateDemoStatus(data.active)).catch(() => {});
+}
+
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
   initSocket();
   initTabs();
+  checkDemoStatus();
 });
