@@ -31,6 +31,7 @@ a = Analysis(
         'device_manager',
         'novastar_protocol',
         'launcher_settings',
+        'demo_device',
     ],
     hookspath=[],
     hooksconfig={},

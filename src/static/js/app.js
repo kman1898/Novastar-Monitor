@@ -272,11 +272,11 @@ function renderDevicePanel(dev) {
           <div class="section-title">📦 Receiving Cards <span class="badge badge-info">${cards.length} total</span></div>
           <div class="card-grid">
             ${cards.map(c => `
-              <div class="card-tile ${c.has_data ? 'active' : 'offline'}">
+              <div class="card-tile ${c.online ? 'active' : 'offline'}">
                 <div class="card-id">${c.label}</div>
                 <div class="card-status">
-                  <span class="status-dot" style="background:var(--${c.has_data ? 'success' : 'danger'})"></span>
-                  ${c.has_data ? 'Online' : 'Offline'}
+                  <span class="status-dot" style="background:var(--${c.online ? 'success' : 'danger'})"></span>
+                  ${c.online ? 'Online' : 'Offline'}
                 </div>
               </div>
             `).join('')}

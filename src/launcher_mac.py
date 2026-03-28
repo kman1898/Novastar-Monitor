@@ -27,7 +27,13 @@ from launcher_settings import load_settings, save_settings, get_network_interfac
 def start_flask_server(settings):
     host = settings.get('interface', '127.0.0.1')
     port = int(settings.get('port', 8050))
-    from app import app, socketio
+    from app import app, socketio, log_event
+    log_event('launcher_start', {
+        'platform': 'macos',
+        'host': host,
+        'port': port,
+        'log_dir': os.environ.get('_NSM_LOG_DIR', 'unknown'),
+    })
     print(f'[NovaStar Monitor] Server starting on {host}:{port}')
     socketio.run(app, host=host, port=port, debug=False,
                  allow_unsafe_werkzeug=True)
