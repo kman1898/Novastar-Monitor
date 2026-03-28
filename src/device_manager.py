@@ -10,8 +10,8 @@ import time
 import json
 from datetime import datetime
 from novastar_protocol import (
-    TCP_PORT, build_read, parse_response, parse_live_monitoring,
-    parse_system_info, parse_nssd, per_card_address,
+    TCP_PORT, build_read, build_read_card, parse_response, parse_live_monitoring,
+    parse_system_info, parse_nssd,
     REG_SYSTEM_INFO, REG_FIRMWARE, REG_DEVICE_PORT1, REG_DEVICE_PORT2,
     REG_BRIGHTNESS, REG_GAMMA, REG_DATETIME, REG_VIDEO_STATUS,
     REG_LIVE_MONITOR, REG_PORT_INFO, REG_CARD_CONFIG,
@@ -86,7 +86,7 @@ class NovaStar_Device:
         self.state["connected"] = False
 
     def read_register(self, reg_addr, reg_len):
-        """Send a READ request and return the response payload."""
+        """Send a broadcast READ request and return the response payload."""
         if not self.connected:
             return None
 
@@ -94,6 +94,26 @@ class NovaStar_Device:
             try:
                 self.seq = (self.seq + 1) & 0xFFFF
                 frame = build_read(self.seq, reg_addr, reg_len)
+                self.sock.sendall(frame)
+                data = self.sock.recv(8192)
+                result = parse_response(data)
+                return result[1] if result else None
+            except socket.timeout:
+                return None
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                self.connected = False
+                self.state["connected"] = False
+                return None
+
+    def read_register_card(self, reg_addr, reg_len, card_index):
+        """Send a per-card READ request targeting a specific receiving card (0-based index)."""
+        if not self.connected:
+            return None
+
+        with self.lock:
+            try:
+                self.seq = (self.seq + 1) & 0xFFFF
+                frame = build_read_card(self.seq, reg_addr, reg_len, card_index)
                 self.sock.sendall(frame)
                 data = self.sock.recv(8192)
                 result = parse_response(data)
@@ -156,22 +176,13 @@ class NovaStar_Device:
         if data and len(data) >= 6:
             self.state["datetime"] = f"20{data[0]:02d}-{data[1]:02d}-{data[2]:02d} {data[4]:02d}:{data[5]:02d}"
 
-        # Live Monitoring (temperature, voltage, cards, link)
+        # Live Monitoring — broadcast read kept for backward compat; per-card reads below
+        # are the authoritative source for temperature/voltage/link data.
         data = self.read_register(*REG_LIVE_MONITOR)
         if data:
             mon = parse_live_monitoring(data)
             if mon:
                 self.state["live_monitoring"] = mon
-
-                # Update history (keep last 300 samples)
-                hist = self.state["history"]
-                hist["temperature"].append(mon["temperature_c"])
-                hist["voltage"].append(mon["voltage_v"])
-                hist["timestamps"].append(now.strftime("%H:%M:%S"))
-                max_hist = 300
-                for key in ("temperature", "voltage", "timestamps"):
-                    if len(hist[key]) > max_hist:
-                        hist[key] = hist[key][-max_hist:]
 
         # Video Status
         data = self.read_register(*REG_VIDEO_STATUS)
@@ -189,20 +200,59 @@ class NovaStar_Device:
                     "timestamp": f"20{data[17]:02d}-{data[18]:02d}-{data[19]:02d} {data[20]:02d}:{data[21]:02d}:{data[22]:02d}",
                 }
 
-        # Per-card scan (every 5th poll to avoid slowdown)
-        card_count = self.state["live_monitoring"].get("card_count", 0)
-        if card_count > 0 and self.state["poll_count"] % 5 == 1:
-            cards = []
-            for i in range(1, card_count + 1):
-                addr = per_card_address(i)
-                cdata = self.read_register(addr, 0x0001)
-                has_data = bool(cdata and len(cdata) > 4 and any(b != 0 for b in cdata[:10]))
-                cards.append({
-                    "index": i,
-                    "label": f"C{i:02d}",
-                    "has_data": has_data,
-                })
+        # Per-card live monitoring — query each receiving card directly.
+        # Uses per-card addressing (cmd=0x01, card_index) confirmed from VX1000 captures.
+        # Card count is detected from the first responsive card's report (byte[11]).
+        detected_count = self.state.get("_detected_card_count", 0)
+        scan_limit = detected_count if detected_count > 0 else 16
+        cards = []
+        for i in range(scan_limit):
+            cdata = self.read_register_card(*REG_LIVE_MONITOR, i)
+            if cdata:
+                mon = parse_live_monitoring(cdata)
+                if mon and mon.get("online"):
+                    if detected_count == 0 and mon.get("card_count", 0) > 0:
+                        detected_count = mon["card_count"]
+                        self.state["_detected_card_count"] = detected_count
+                        scan_limit = detected_count
+                    cards.append({
+                        "index": i,
+                        "label": f"C{i + 1:02d}",
+                        "online": True,
+                        "temperature_c": mon["temperature_c"],
+                        "voltage_v": mon["voltage_v"],
+                        "link_status": mon["link_status"],
+                        "link_raw": mon["link_raw"],
+                        "firmware": mon["firmware"],
+                        "mac_address": mon["mac_address"],
+                    })
+                    continue
+            cards.append({"index": i, "label": f"C{i + 1:02d}", "online": False})
+        if cards:
             self.state["receiving_cards"] = cards
+
+            # Update live_monitoring and history from per-card aggregate.
+            online_cards = [c for c in cards if c.get("online")]
+            if online_cards:
+                avg_temp = round(sum(c["temperature_c"] for c in online_cards) / len(online_cards), 1)
+                avg_volt = round(sum(c["voltage_v"] for c in online_cards) / len(online_cards), 2)
+                max_temp = max(c["temperature_c"] for c in online_cards)
+                # Merge per-card aggregate into live_monitoring
+                self.state["live_monitoring"].update({
+                    "card_count": len(online_cards),
+                    "temperature_c": avg_temp,
+                    "temperature_max_c": max_temp,
+                    "voltage_v": avg_volt,
+                    "online": True,
+                })
+                # History (keep last 300 samples)
+                hist = self.state["history"]
+                hist["temperature"].append(avg_temp)
+                hist["voltage"].append(avg_volt)
+                hist["timestamps"].append(now.strftime("%H:%M:%S"))
+                for key in ("temperature", "voltage", "timestamps"):
+                    if len(hist[key]) > 300:
+                        hist[key] = hist[key][-300:]
 
 
 class DeviceManager:

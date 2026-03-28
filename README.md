@@ -1,5 +1,7 @@
 # NovaStar Monitor
 
+**Version 0.2.0**
+
 A real-time monitoring dashboard for NovaStar LED video processing systems. Connects directly to NovaStar controllers (VX1000, MCTRL660, and compatible) via their binary TCP protocol on port 5200, providing live visibility into temperature, voltage, receiving card status, link redundancy, and more.
 
 ## Features
@@ -98,6 +100,27 @@ src/
 - Python 3.10+
 - Network access to NovaStar controller on TCP port 5200
 - Close NovaLCT/SmartLCT before connecting (can't share TCP connection)
+
+## Changelog
+
+### v0.2.0
+- Per-card monitoring via direct receiving card addressing (confirmed from VX1000 Wireshark captures)
+- Individual temperature, voltage, link status, and firmware per receiving card
+- Auto-detection of receiving card count
+- CI/CD pipeline: cross-platform tests, linting, build integrity checks
+- Release workflow with macOS/Windows builds and optional code signing
+- Test suite (58 tests) covering protocol codec, data parsing, and device management
+
+### v0.1.0
+- Initial release
+- Flask + SocketIO monitoring dashboard
+- NovaStar binary TCP protocol codec (port 5200)
+- Multi-device support with threaded polling
+- Temperature and voltage charts
+- Persistent error log with CSV export
+- Configurable alert thresholds
+- System tray launcher (Windows, macOS, Linux)
+- PyInstaller build spec
 
 ## License
 

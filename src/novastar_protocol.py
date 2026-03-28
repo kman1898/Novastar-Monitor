@@ -38,8 +38,24 @@ def checksum(data):
 
 
 def build_read(seq, register, length, device=0xFE, port=0x00):
-    """Build a 20-byte READ request frame."""
+    """Build a 20-byte READ request frame (broadcast / sending-card target)."""
     frame = struct.pack(">HHBB6xIH", HEADER_REQUEST, seq, device, port, register, length)
+    frame += struct.pack(">H", checksum(frame))
+    return frame
+
+
+def build_read_card(seq, register, length, card_index, device=0xFE, port=0x00):
+    """Build a 20-byte READ request targeting a specific receiving card.
+
+    Per-card addressing (confirmed from VX1000 Wireshark captures):
+      byte[6] = 0x01  (direct-to-receiving-card command)
+      byte[7] = 0x00
+      byte[8] = card_index  (0-based, 0x00–0x0D for 14 cards)
+      bytes[9-11] = 0x00 0x00 0x00
+    """
+    frame = struct.pack(">HHBB", HEADER_REQUEST, seq, device, port)
+    frame += bytes([0x01, 0x00, card_index & 0xFF, 0x00, 0x00, 0x00])
+    frame += struct.pack(">IH", register, length)
     frame += struct.pack(">H", checksum(frame))
     return frame
 

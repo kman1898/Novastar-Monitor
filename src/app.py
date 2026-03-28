@@ -82,39 +82,52 @@ def on_device_update(device_id, state):
     lm = state.get('live_monitoring', {})
     temp = lm.get('temperature_c')
     voltage = lm.get('voltage_v')
+    device_name = state.get('name', device_id)
 
     if temp and temp >= settings.get('temp_critical', 75):
-        socketio.emit('alert', {
-            'severity': 'CRITICAL',
-            'device': state.get('name', device_id),
-            'message': f"Temperature {temp:.1f}°C exceeds critical threshold",
-            'timestamp': datetime.now().isoformat(),
-        })
+        # Avoid duplicate alerts — check if same alert exists in last 60 seconds
+        if not _recent_alert_exists('CRITICAL', device_name, 'Temperature'):
+            add_error('CRITICAL', device_name,
+                      f"Temperature {temp:.1f}°C exceeds critical threshold of {settings.get('temp_critical', 75)}°C",
+                      value=temp)
     elif temp and temp >= settings.get('temp_warning', 60):
-        socketio.emit('alert', {
-            'severity': 'WARNING',
-            'device': state.get('name', device_id),
-            'message': f"Temperature {temp:.1f}°C exceeds warning threshold",
-            'timestamp': datetime.now().isoformat(),
-        })
+        if not _recent_alert_exists('WARNING', device_name, 'Temperature'):
+            add_error('WARNING', device_name,
+                      f"Temperature {temp:.1f}°C exceeds warning threshold of {settings.get('temp_warning', 60)}°C",
+                      value=temp)
 
     if voltage and voltage < settings.get('voltage_min', 4.7):
-        socketio.emit('alert', {
-            'severity': 'WARNING',
-            'device': state.get('name', device_id),
-            'message': f"Voltage {voltage:.2f}V below minimum threshold",
-            'timestamp': datetime.now().isoformat(),
-        })
+        if not _recent_alert_exists('WARNING', device_name, 'Voltage'):
+            add_error('WARNING', device_name,
+                      f"Voltage {voltage:.2f}V below minimum threshold of {settings.get('voltage_min', 4.7)}V",
+                      value=voltage)
+
+
+def _recent_alert_exists(severity, device, keyword, seconds=60):
+    """Check if a similar alert was created within the last N seconds."""
+    cutoff = datetime.now().timestamp() - seconds
+    for entry in reversed(_error_log[-20:]):
+        try:
+            entry_ts = datetime.fromisoformat(entry['timestamp']).timestamp()
+            if (entry_ts > cutoff and
+                entry['severity'] == severity and
+                entry['device'] == device and
+                keyword in entry.get('message', '')):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def on_device_error(device_id, error_info):
     """Called by device manager on errors."""
-    socketio.emit('alert', {
-        'severity': 'CRITICAL',
-        'device': device_id,
-        'message': f"Connection error: {error_info.get('error', 'unknown')}",
-        'timestamp': datetime.now().isoformat(),
-    })
+    device_name = device_id
+    dev = manager.devices.get(device_id)
+    if dev:
+        device_name = dev.state.get('name', device_id)
+    if not _recent_alert_exists('CRITICAL', device_name, 'Connection'):
+        add_error('CRITICAL', device_name,
+                  f"Connection error: {error_info.get('error', 'unknown')}")
 
 
 manager.set_callbacks(on_update=on_device_update, on_error=on_device_error)
@@ -122,11 +135,12 @@ manager.set_callbacks(on_update=on_device_update, on_error=on_device_error)
 
 @socketio.on('connect')
 def handle_connect():
-    """Send current state to newly connected client."""
+    """Send current state and error log to newly connected client."""
     all_states = manager.get_all_states()
     emit('full_state', {
         'devices': all_states,
         'settings': load_settings(),
+        'errors': _error_log[-100:][::-1],
         'timestamp': datetime.now().isoformat(),
     })
 
@@ -229,10 +243,181 @@ def api_version():
     return jsonify({"version": version})
 
 
+# ── Error Log Persistence ─────────────────────────────────
+
+ERROR_LOG_FILE = os.path.join(APP_DIR, 'error_log.json')
+MAX_ERROR_LOG = 500
+_error_log = []
+
+
+def load_error_log():
+    global _error_log
+    try:
+        if os.path.exists(ERROR_LOG_FILE):
+            with open(ERROR_LOG_FILE, 'r') as f:
+                _error_log = json.load(f)
+    except Exception:
+        _error_log = []
+    return _error_log
+
+
+def save_error_log():
+    try:
+        with open(ERROR_LOG_FILE, 'w') as f:
+            json.dump(_error_log[-MAX_ERROR_LOG:], f, indent=2)
+    except Exception as e:
+        print(f"[NovaStar Monitor] Failed to save error log: {e}")
+
+
+def add_error(severity, device, message, cabinet=None, port=None, value=None):
+    """Add an error to the persistent log and broadcast via SocketIO."""
+    entry = {
+        'id': len(_error_log) + 1,
+        'timestamp': datetime.now().isoformat(),
+        'severity': severity,
+        'device': device,
+        'message': message,
+        'cabinet': cabinet,
+        'port': port,
+        'value': value,
+        'resolved': False,
+        'resolved_at': None,
+        'acknowledged': False,
+    }
+    _error_log.append(entry)
+    save_error_log()
+    socketio.emit('alert', entry)
+    return entry
+
+
+@app.route('/api/errors', methods=['GET'])
+def api_list_errors():
+    """Get error log with optional filters."""
+    severity = request.args.get('severity')
+    device = request.args.get('device')
+    resolved = request.args.get('resolved')
+    limit = int(request.args.get('limit', 100))
+
+    filtered = _error_log.copy()
+    if severity and severity != 'ALL':
+        filtered = [e for e in filtered if e['severity'] == severity]
+    if device and device != 'ALL':
+        filtered = [e for e in filtered if e['device'] == device]
+    if resolved == 'true':
+        filtered = [e for e in filtered if e['resolved']]
+    elif resolved == 'false':
+        filtered = [e for e in filtered if not e['resolved']]
+
+    return jsonify(filtered[-limit:][::-1])  # Newest first
+
+
+@app.route('/api/errors/<int:error_id>/resolve', methods=['POST'])
+def api_resolve_error(error_id):
+    for entry in _error_log:
+        if entry['id'] == error_id:
+            entry['resolved'] = True
+            entry['resolved_at'] = datetime.now().isoformat()
+            save_error_log()
+            socketio.emit('error_resolved', {'id': error_id})
+            return jsonify({"status": "resolved"})
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.route('/api/errors/<int:error_id>/acknowledge', methods=['POST'])
+def api_acknowledge_error(error_id):
+    for entry in _error_log:
+        if entry['id'] == error_id:
+            entry['acknowledged'] = True
+            save_error_log()
+            return jsonify({"status": "acknowledged"})
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.route('/api/errors/clear-resolved', methods=['POST'])
+def api_clear_resolved():
+    """Remove all resolved errors from the log."""
+    global _error_log
+    _error_log = [e for e in _error_log if not e['resolved']]
+    save_error_log()
+    return jsonify({"status": "cleared"})
+
+
+# ── CSV Export ────────────────────────────────────────────
+
+@app.route('/api/export/errors.csv', methods=['GET'])
+def api_export_errors_csv():
+    """Export error log as CSV download."""
+    import csv
+    import io
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Timestamp', 'Severity', 'Device', 'Cabinet', 'Port', 'Message',
+                     'Value', 'Resolved', 'Resolved At'])
+
+    for e in reversed(_error_log):
+        writer.writerow([
+            e.get('timestamp', ''),
+            e.get('severity', ''),
+            e.get('device', ''),
+            e.get('cabinet', ''),
+            e.get('port', ''),
+            e.get('message', ''),
+            e.get('value', ''),
+            e.get('resolved', False),
+            e.get('resolved_at', ''),
+        ])
+
+    from flask import make_response
+    response = make_response(output.getvalue())
+    response.headers['Content-Type'] = 'text/csv'
+    response.headers['Content-Disposition'] = (
+        f'attachment; filename=novastar_errors_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    )
+    return response
+
+
+@app.route('/api/export/monitoring.csv', methods=['GET'])
+def api_export_monitoring_csv():
+    """Export current monitoring snapshot as CSV."""
+    import csv
+    import io
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Device', 'IP', 'Connected', 'Temperature', 'Voltage',
+                     'Brightness', 'Card Count', 'Link Status', 'Firmware'])
+
+    for dev in manager.get_all_states():
+        lm = dev.get('live_monitoring', {})
+        writer.writerow([
+            dev.get('name', ''),
+            dev.get('ip', ''),
+            dev.get('connected', False),
+            lm.get('temperature_c', ''),
+            lm.get('voltage_v', ''),
+            dev.get('brightness_pct', ''),
+            lm.get('card_count', ''),
+            lm.get('link_status', ''),
+            dev.get('firmware_version', ''),
+        ])
+
+    from flask import make_response
+    response = make_response(output.getvalue())
+    response.headers['Content-Type'] = 'text/csv'
+    response.headers['Content-Disposition'] = (
+        f'attachment; filename=novastar_snapshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    )
+    return response
+
+
 # ── Startup ───────────────────────────────────────────────
 
 def init_devices():
-    """Load saved devices and start polling."""
+    """Load saved devices, error log, and start polling."""
+    load_error_log()
+    print(f"[NovaStar Monitor] Loaded {len(_error_log)} error log entries")
+
     settings = load_settings()
     for dev_conf in settings.get('devices', []):
         try:

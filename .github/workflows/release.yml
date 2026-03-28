@@ -1,0 +1,219 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number (e.g. 0.2.0)"
+        required: true
+      branch:
+        description: "Branch to build from (default: main)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Run tests first - fail fast before building
+  # ──────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -r src/requirements.txt
+          pip install pytest
+      - name: Run tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/ -v --tb=short
+
+  # ──────────────────────────────────────────────
+  # macOS Build
+  # ──────────────────────────────────────────────
+  build-macos:
+    name: Build macOS
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -r src/requirements.txt
+          pip install pyinstaller rumps
+
+      - name: Build app
+        run: |
+          source .venv/bin/activate
+          cd src && python -m PyInstaller novastar_monitor.spec --noconfirm
+          cp -R "dist/NovaStar Monitor.app" "../NovaStar Monitor.app"
+
+      - name: Import code signing certificate
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PWD: ${{ secrets.KEYCHAIN_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" build.keychain
+
+      - name: Sign app bundle
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --deep --sign "$SIGNING_IDENTITY" \
+            --options runtime \
+            --entitlements /dev/null \
+            "NovaStar Monitor.app"
+
+      - name: Notarize app
+        if: env.MACOS_NOTARIZE_APPLE_ID != ''
+        env:
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+          MACOS_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent "NovaStar Monitor.app" "NSM-notarize.zip"
+          xcrun notarytool submit "NSM-notarize.zip" \
+            --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+            --password "$MACOS_NOTARIZE_PASSWORD" \
+            --team-id "$MACOS_NOTARIZE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "NovaStar Monitor.app"
+
+      - name: Create release ZIP
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          ditto -c -k --keepParent "NovaStar Monitor.app" \
+            "novastar_monitor_v${VERSION}_macos.zip"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-build
+          path: novastar_monitor_v*_macos.zip
+
+  # ──────────────────────────────────────────────
+  # Windows Build
+  # ──────────────────────────────────────────────
+  build-windows:
+    name: Build Windows
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv\Scripts\Activate.ps1
+          pip install -r src/requirements.txt
+          pip install pyinstaller pystray
+
+      - name: Build executable
+        run: |
+          .venv\Scripts\Activate.ps1
+          cd src
+          python -m PyInstaller novastar_monitor.spec --noconfirm
+          Copy-Item -Recurse -Force "dist\NovaStar Monitor" "..\NovaStar Monitor App"
+
+      - name: Sign executable
+        if: env.WINDOWS_CERTIFICATE != ''
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PWD: ${{ secrets.WINDOWS_CERTIFICATE_PWD }}
+        run: |
+          $cert = [System.Convert]::FromBase64String("$env:WINDOWS_CERTIFICATE")
+          [System.IO.File]::WriteAllBytes("certificate.pfx", $cert)
+          & 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe' sign `
+            /f certificate.pfx `
+            /p "$env:WINDOWS_CERTIFICATE_PWD" `
+            /tr http://timestamp.digicert.com `
+            /td sha256 `
+            /fd sha256 `
+            "NovaStar Monitor App\NovaStar Monitor.exe"
+          Remove-Item certificate.pfx
+
+      - name: Create release ZIP
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          if (-not $version -or $version -eq "${{ github.ref_name }}") {
+            $version = "${{ github.event.inputs.version }}"
+          }
+          Compress-Archive -Path "NovaStar Monitor App" `
+            -DestinationPath "novastar_monitor_v${version}_windows.zip"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-build
+          path: novastar_monitor_v*_windows.zip
+
+  # ──────────────────────────────────────────────
+  # Create GitHub Release & Upload Assets
+  # ──────────────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum macos-build/*.zip windows-build/*.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "NovaStar Monitor ${{ github.ref_name }}"
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/macos-build/*.zip
+            artifacts/windows-build/*.zip
+            artifacts/checksums.txt

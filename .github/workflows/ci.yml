@@ -1,0 +1,223 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev/draft, feature/**]
+    tags-ignore: ['**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  version-check:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -r src/requirements.txt
+          pip install pytest
+
+      - name: Check version consistency
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/test_version.py -v --tb=short
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install flake8
+
+      - name: Run flake8 on all Python files
+        run: |
+          source .venv/bin/activate
+          # Fatal errors (syntax, undefined names) — must pass
+          flake8 src/app.py src/device_manager.py src/novastar_protocol.py src/launcher_settings.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Style warnings — advisory
+          flake8 src/app.py src/device_manager.py src/novastar_protocol.py --count --exit-zero --max-complexity=15 --max-line-length=150 --statistics
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -r src/requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m venv .venv
+          .venv\Scripts\activate
+          pip install -r src/requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run tests (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/ -v --tb=short --cov=src --cov-report=term-missing
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .venv\Scripts\activate
+          python -m pytest tests/ -v --tb=short --cov=src --cov-report=term-missing
+
+  build-check:
+    name: Build Integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -r src/requirements.txt
+
+      - name: Verify all source files referenced in spec exist
+        run: |
+          echo "=== Checking PyInstaller spec file references ==="
+          for f in launcher_mac.py launcher_pc.py app.py device_manager.py novastar_protocol.py launcher_settings.py; do
+            if [ ! -f "src/$f" ]; then
+              echo "FAIL: src/$f referenced in spec but does not exist!"
+              exit 1
+            fi
+            echo "  OK: src/$f"
+          done
+
+      - name: Verify spec version matches VERSION.txt
+        run: |
+          echo "=== Checking spec version matches VERSION.txt ==="
+          VER_TXT=$(cat src/VERSION.txt | tr -d '[:space:]')
+          VER_SPEC=$(grep -oE "CFBundleShortVersionString.*'[0-9]+\.[0-9]+[^']*'" src/novastar_monitor.spec | grep -oE "[0-9]+\.[0-9]+[^']*")
+          echo "  VERSION.txt: $VER_TXT"
+          echo "  Spec file:   $VER_SPEC"
+          if [ "$VER_TXT" != "$VER_SPEC" ]; then
+            echo "FAIL: Version mismatch! VERSION.txt=$VER_TXT but spec=$VER_SPEC"
+            exit 1
+          fi
+          echo "  OK: Versions match"
+
+      - name: Compile all Python source files
+        run: |
+          echo "=== Compiling all Python files ==="
+          source .venv/bin/activate
+          ERRORS=0
+          for f in src/*.py; do
+            if python -m py_compile "$f" 2>&1; then
+              echo "  OK: $f"
+            else
+              echo "  FAIL: $f"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          if [ $ERRORS -gt 0 ]; then
+            echo "FAIL: $ERRORS files failed to compile"
+            exit 1
+          fi
+
+      - name: Verify static assets referenced in HTML exist
+        run: |
+          echo "=== Checking static file references ==="
+          ERRORS=0
+          for ref in $(grep -oE 'href="/static/[^"]*"' src/templates/index.html | sed 's/href="\/static\///;s/"//'); do
+            if [ ! -f "src/static/$ref" ]; then
+              echo "  FAIL: src/static/$ref referenced in HTML but missing"
+              ERRORS=$((ERRORS + 1))
+            else
+              echo "  OK: src/static/$ref"
+            fi
+          done
+          for ref in $(grep -oE 'src="/static/[^"]*"' src/templates/index.html | sed 's/src="\/static\///;s/"//'); do
+            if [ ! -f "src/static/$ref" ]; then
+              echo "  FAIL: src/static/$ref referenced in HTML but missing"
+              ERRORS=$((ERRORS + 1))
+            else
+              echo "  OK: src/static/$ref"
+            fi
+          done
+          if [ $ERRORS -gt 0 ]; then
+            echo "FAIL: $ERRORS static files missing"
+            exit 1
+          fi
+
+      - name: Verify template and bundled data files exist
+        run: |
+          echo "=== Checking bundled files ==="
+          test -f src/templates/index.html || { echo "FAIL: index.html missing"; exit 1; }
+          echo "  OK: src/templates/index.html"
+          test -f src/VERSION.txt || { echo "FAIL: VERSION.txt missing"; exit 1; }
+          echo "  OK: src/VERSION.txt"
+          grep -qE '^[0-9]+\.[0-9]+' src/VERSION.txt || { echo "FAIL: VERSION.txt has no valid version"; exit 1; }
+          echo "  OK: VERSION.txt has valid version"
+
+      - name: Verify Python imports resolve
+        run: |
+          echo "=== Checking critical imports ==="
+          source .venv/bin/activate
+          python -c "import flask; print(f'  OK: flask {flask.__version__}')"
+          python -c "import flask_socketio; print('  OK: flask_socketio')"
+          python -c "from PIL import Image; print('  OK: PIL/Pillow')"
+          python -c "import sys; sys.path.insert(0, 'src'); from launcher_settings import load_settings; print('  OK: launcher_settings')"
+
+  js-lint:
+    name: JS Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install ESLint
+        run: npm install eslint@8
+
+      - name: Lint JavaScript
+        run: |
+          npx eslint src/static/js/*.js --no-eslintrc \
+            --rule '{"no-undef": "off", "no-unused-vars": "warn"}' \
+            --env browser,es2021 \
+            --parser-options ecmaVersion:2022 \
+            || true  # Advisory only for now
