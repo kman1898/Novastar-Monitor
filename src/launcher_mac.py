@@ -64,7 +64,7 @@ def main():
 
         class NovaStarMonitorApp(rumps.App):
             def __init__(self):
-                super().__init__('NovaStar Monitor', title='N\u2605')
+                super().__init__('NovaStar Monitor', title='N\u2605', quit_button=None)
                 self._sim_item = rumps.MenuItem('Simulation Mode')
 
             @rumps.clicked('Open Dashboard')
