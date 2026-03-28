@@ -125,6 +125,19 @@
       <span id="settings-saved" class="color-success" style="margin-left:10px;font-size:12px;display:none;">Saved ✓</span>
     </div>
     <div class="section">
+      <div class="section-title">Simulation Mode</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:10px;">
+        Enable a simulated VX1000 with 14 receiving cards for UI testing without live hardware.
+      </p>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <label class="toggle-switch">
+          <input type="checkbox" id="demo-toggle" onchange="toggleSimulation(this.checked)">
+          <span class="toggle-slider"></span>
+        </label>
+        <span id="demo-status" style="font-size:13px;">Disabled</span>
+      </div>
+    </div>
+    <div class="section">
       <div class="section-title">About</div>
       <div class="info-grid" style="max-width:500px;">
         <div class="info-item"><div class="info-label">Version</div><div class="info-value" id="app-version">—</div></div>

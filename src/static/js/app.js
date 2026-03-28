@@ -555,8 +555,47 @@ function infoItem(label, value, colorClass) {
   </div>`;
 }
 
+// ── Simulation Mode ──
+function toggleSimulation(enable) {
+  fetch('/api/demo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enable }),
+  })
+  .then(r => r.json())
+  .then(data => {
+    updateDemoStatus(data.active);
+    if (!data.active) {
+      // Remove demo device from local state
+      delete devices['demo-vx1000'];
+      renderAll();
+    }
+  })
+  .catch(err => {
+    alert('Failed to toggle simulation: ' + err);
+    // Revert checkbox
+    const toggle = document.getElementById('demo-toggle');
+    if (toggle) toggle.checked = !enable;
+  });
+}
+
+function updateDemoStatus(active) {
+  const toggle = document.getElementById('demo-toggle');
+  const status = document.getElementById('demo-status');
+  if (toggle) toggle.checked = active;
+  if (status) {
+    status.textContent = active ? 'Active — Demo VX1000' : 'Disabled';
+    status.style.color = active ? 'var(--success)' : 'var(--muted)';
+  }
+}
+
+function checkDemoStatus() {
+  fetch('/api/demo').then(r => r.json()).then(data => updateDemoStatus(data.active)).catch(() => {});
+}
+
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
   initSocket();
   initTabs();
+  checkDemoStatus();
 });
