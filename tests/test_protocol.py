@@ -254,3 +254,224 @@ class TestParseNSSD:
 
     def test_short_data(self):
         assert proto.parse_nssd(b"NSS") is None
+
+
+# ── Length Encoding ────────────────────────────────────────
+
+
+class TestEncodeLength:
+    """Test the NovaStar split-format length encoding."""
+
+    def test_1_byte(self):
+        assert proto.encode_length(1) == 0x0100
+
+    def test_2_bytes(self):
+        assert proto.encode_length(2) == 0x0200
+
+    def test_8_bytes(self):
+        assert proto.encode_length(8) == 0x0800
+
+    def test_82_bytes(self):
+        assert proto.encode_length(82) == 0x5200
+
+    def test_256_bytes(self):
+        assert proto.encode_length(256) == 0x0001
+
+    def test_512_bytes(self):
+        assert proto.encode_length(512) == 0x0002
+
+
+class TestDecodeLength:
+    """Test the NovaStar split-format length decoding."""
+
+    def test_page_mode_1(self):
+        assert proto.decode_length(0x0001) == 256
+
+    def test_page_mode_2(self):
+        assert proto.decode_length(0x0002) == 512
+
+    def test_byte_mode_1(self):
+        assert proto.decode_length(0x0100) == 1
+
+    def test_byte_mode_2(self):
+        assert proto.decode_length(0x0200) == 2
+
+    def test_byte_mode_8(self):
+        assert proto.decode_length(0x0800) == 8
+
+    def test_byte_mode_82(self):
+        assert proto.decode_length(0x5200) == 82
+
+    def test_round_trip(self):
+        for byte_count in [1, 2, 8, 82, 256, 512]:
+            encoded = proto.encode_length(byte_count)
+            assert proto.decode_length(encoded) == byte_count
+
+    def test_existing_registers_decode_correctly(self):
+        """Verify all existing register definitions decode to expected sizes."""
+        assert proto.decode_length(proto.REG_SYSTEM_INFO[1]) == 256
+        assert proto.decode_length(proto.REG_FIRMWARE[1]) == 2
+        assert proto.decode_length(proto.REG_BRIGHTNESS[1]) == 1
+        assert proto.decode_length(proto.REG_GAMMA[1]) == 2
+        assert proto.decode_length(proto.REG_DATETIME[1]) == 8
+        assert proto.decode_length(proto.REG_VIDEO_STATUS[1]) == 512
+        assert proto.decode_length(proto.REG_LIVE_MONITOR[1]) == 82
+
+
+# ── H-Series Parsing ──────────────────────────────────────
+
+
+class TestHPortBitmask:
+    """Test H-series port connectivity bitmask parsing."""
+
+    def test_all_connected(self):
+        """0xFF = all 8 low ports connected."""
+        data = bytearray(512)
+        data[31] = 0xFF
+        result = proto.parse_h_port_bitmask(bytes(data))
+        assert result[1] is True
+        assert result[8] is True
+
+    def test_none_connected(self):
+        data = bytearray(512)
+        data[31] = 0x00
+        result = proto.parse_h_port_bitmask(bytes(data))
+        assert result[1] is False
+        assert result[15] is False
+
+    def test_capture_original(self):
+        """0xAF from original capture = 6 ports connected."""
+        data = bytearray(512)
+        data[31] = 0xAF  # 10101111
+        result = proto.parse_h_port_bitmask(bytes(data))
+        assert result[1] is True   # bit 0
+        assert result[2] is True   # bit 1
+        assert result[3] is True   # bit 2
+        assert result[4] is True   # bit 3
+        assert result[5] is False  # bit 4
+        assert result[6] is True   # bit 5
+
+    def test_capture_backup(self):
+        """0xAC from backup capture = ports 1,2 disconnected."""
+        data = bytearray(512)
+        data[31] = 0xAC  # 10101100
+        result = proto.parse_h_port_bitmask(bytes(data))
+        assert result[1] is False  # bit 0 — port 1 disconnected
+        assert result[2] is False  # bit 1 — port 2 disconnected
+        assert result[3] is True   # bit 2 — port 3 still up
+        assert result[4] is True   # bit 3
+
+    def test_short_data(self):
+        assert proto.parse_h_port_bitmask(b"\x00" * 10) == {}
+
+    def test_none_data(self):
+        assert proto.parse_h_port_bitmask(None) == {}
+
+
+class TestHCardLink:
+    """Test H-series per-card link path status."""
+
+    def test_all_paths(self):
+        data = bytearray(512)
+        data[1] = 0x7F  # 01111111 = 7 paths
+        result = proto.parse_h_card_link(bytes(data))
+        assert result == (7, 7)
+
+    def test_partial_paths(self):
+        data = bytearray(512)
+        data[1] = 0x3D  # 00111101 = 5 paths
+        result = proto.parse_h_card_link(bytes(data))
+        assert result == (5, 7)
+
+    def test_no_paths(self):
+        data = bytearray(512)
+        data[1] = 0x00
+        result = proto.parse_h_card_link(bytes(data))
+        assert result == (0, 7)
+
+    def test_short_data(self):
+        assert proto.parse_h_card_link(b"\x1c") is None
+
+    def test_none(self):
+        assert proto.parse_h_card_link(None) is None
+
+
+class TestHCardTemperature:
+    """Test H-series per-card temperature parsing."""
+
+    def test_capture_value(self):
+        """0x5D = 93 → 46.5°C from capture."""
+        data = bytes([0x5D]) + b"\x00" * 511
+        assert proto.parse_h_card_temperature(data) == 46.5
+
+    def test_zero(self):
+        assert proto.parse_h_card_temperature(b"\x00") == 0.0
+
+    def test_max(self):
+        assert proto.parse_h_card_temperature(b"\xFF") == 127.5
+
+    def test_none(self):
+        assert proto.parse_h_card_temperature(None) is None
+
+    def test_empty(self):
+        assert proto.parse_h_card_temperature(b"") is None
+
+
+class TestHCardDataRegister:
+    """Test H-series per-card data channel register addressing."""
+
+    def test_channel_0(self):
+        addr, length = proto.h_card_data_register(0)
+        assert addr == 0x00400003
+
+    def test_channel_1(self):
+        addr, length = proto.h_card_data_register(1)
+        assert addr == 0x00420003
+
+    def test_channel_7(self):
+        addr, length = proto.h_card_data_register(7)
+        assert addr == 0x004E0003
+
+    def test_length_is_512(self):
+        for ch in range(8):
+            _, length = proto.h_card_data_register(ch)
+            assert proto.decode_length(length) == 512
+
+
+class TestHPortVideoRegister:
+    """Test H-series per-port video status register addressing."""
+
+    def test_port_1(self):
+        addr, length = proto.h_port_video_register(1)
+        assert addr == 0x00010002
+
+    def test_port_2(self):
+        addr, length = proto.h_port_video_register(2)
+        assert addr == 0x00020002
+
+    def test_port_15(self):
+        addr, length = proto.h_port_video_register(15)
+        assert addr == 0x000F0002
+
+    def test_length_is_512(self):
+        _, length = proto.h_port_video_register(1)
+        assert proto.decode_length(length) == 512
+
+
+class TestHSystemInfo:
+    """Test H-series system info parsing."""
+
+    def test_capture_data(self):
+        """From capture: byte[0]=0x09 (A8s), bytes[1:5]=45 04 06 02."""
+        data = bytes.fromhex("0945040602010405015100000000000000000000")
+        result = proto.parse_h_system_info(data)
+        assert result["hw_type"] == "0x09"
+        assert result["fpga_major"] == 0x45
+        assert result["fpga_minor"] == 4
+        assert result["fw_revision"] == 6
+
+    def test_short_data(self):
+        assert proto.parse_h_system_info(b"\x09" * 5) is None
+
+    def test_none(self):
+        assert proto.parse_h_system_info(None) is None

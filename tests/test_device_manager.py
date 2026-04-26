@@ -38,6 +38,62 @@ class TestNovaStarDevice:
         dev = NovaStar_Device("dev1", "Test", "192.168.0.10")
         assert dev.read_register_card(0x0000000A, 0x5200, 0) is None
 
+    def test_read_register_accepts_port_kwarg(self):
+        """Port kwarg must not raise (returns None when disconnected)."""
+        dev = NovaStar_Device("dev1", "Test", "192.168.0.10")
+        assert dev.read_register(0x0000000A, 0x5200, port=0x03) is None
+
+    def test_read_register_card_accepts_port_kwarg(self):
+        dev = NovaStar_Device("dev1", "Test", "192.168.0.10")
+        assert dev.read_register_card(0x0000000A, 0x5200, 0, port=0x03) is None
+
+
+class TestDeviceTypeDetection:
+    """Test automatic device type detection from port number."""
+
+    def test_vx1000_default_port(self):
+        dev = NovaStar_Device("dev1", "VX1000", "192.168.0.10")
+        assert dev.device_type == "vx1000"
+        assert dev.state["device_type"] == "vx1000"
+
+    def test_vx1000_explicit_port(self):
+        dev = NovaStar_Device("dev1", "VX1000", "192.168.0.10", port=5200)
+        assert dev.device_type == "vx1000"
+
+    def test_h_series_port(self):
+        dev = NovaStar_Device("dev1", "H-Series", "192.168.0.10", port=5203)
+        assert dev.device_type == "h_series"
+        assert dev.state["device_type"] == "h_series"
+
+    def test_unknown_port_defaults_vx1000(self):
+        dev = NovaStar_Device("dev1", "Test", "192.168.0.10", port=9999)
+        assert dev.device_type == "vx1000"
+
+
+class TestHSeriesState:
+    """Test H-series state dict structure."""
+
+    def test_ports_dict_exists(self):
+        dev = NovaStar_Device("dev1", "H", "192.168.0.10", port=5203)
+        assert "ports" in dev.state
+        assert isinstance(dev.state["ports"], dict)
+        assert dev.state["ports"] == {}
+
+    def test_port_bitmask_default(self):
+        dev = NovaStar_Device("dev1", "H", "192.168.0.10", port=5203)
+        assert dev.state["port_bitmask"] == 0
+
+    def test_active_ports_default(self):
+        dev = NovaStar_Device("dev1", "H", "192.168.0.10", port=5203)
+        assert dev.state["active_ports"] == []
+
+    def test_vx1000_also_has_port_fields(self):
+        """VX1000 state dict includes port fields for forward compat."""
+        dev = NovaStar_Device("dev1", "VX", "192.168.0.10")
+        assert "ports" in dev.state
+        assert "port_bitmask" in dev.state
+        assert "active_ports" in dev.state
+
 
 class TestDeviceManager:
     def test_add_device(self):
