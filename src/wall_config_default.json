@@ -1,0 +1,105 @@
+{
+  "wall_name": "Main Wall",
+  "description": "Default wall topology decoded from H-series Wireshark captures and operator-provided diagrams.",
+  "panel": { "width": 60, "height": 120 },
+  "canvas": { "width": 3840, "height": 2160 },
+  "pillars": [
+    {
+      "id": "srr",
+      "name": "SRR Pillar",
+      "canvas_position": { "x": 0, "y": 0 },
+      "size": { "width": 600, "height": 1560 },
+      "color": "#8B3A3A",
+      "ports": [1, 2],
+      "blanks": [[0, 0], [0, 7], [0, 8], [0, 9]]
+    },
+    {
+      "id": "sr",
+      "name": "SR Pillar",
+      "canvas_position": { "x": 600, "y": 0 },
+      "size": { "width": 840, "height": 1800 },
+      "color": "#7A4A6E",
+      "ports": [3, 4, 5]
+    },
+    {
+      "id": "main_top",
+      "name": "Main Top",
+      "canvas_position": { "x": 1440, "y": 0 },
+      "size": { "width": 780, "height": 2160 },
+      "color": "#3F4A8C",
+      "ports": [6, 7, 8],
+      "blanks": [[0, 0], [0, 1], [0, 11], [0, 12]]
+    },
+    {
+      "id": "sl",
+      "name": "SL Pillar",
+      "canvas_position": { "x": 2220, "y": 0 },
+      "size": { "width": 840, "height": 1800 },
+      "color": "#7A7A3F",
+      "ports": [9, 10, 11]
+    },
+    {
+      "id": "sll",
+      "name": "SLL Pillar",
+      "canvas_position": { "x": 3060, "y": 0 },
+      "size": { "width": 600, "height": 1560 },
+      "color": "#3F8C5C",
+      "ports": [12, 13],
+      "blanks": [[0, 0], [0, 1], [0, 8], [0, 9]]
+    },
+    {
+      "id": "dj_booth",
+      "name": "DJ Booth",
+      "canvas_position": { "x": 0, "y": 1920 },
+      "size": { "width": 900, "height": 120 },
+      "color": "#3F8C8C",
+      "ports": [14]
+    },
+    {
+      "id": "main_bottom",
+      "name": "Main Bottom",
+      "canvas_position": { "x": 2220, "y": 1920 },
+      "size": { "width": 780, "height": 240 },
+      "color": "#5A6AAC",
+      "ports": [15]
+    }
+  ],
+  "ports": [
+    { "port": 1,  "label": "A1",  "pillar": "srr",         "card_count": 76, "opt": 1, "opt_subport": 1, "chain": null },
+    { "port": 2,  "label": "A2",  "pillar": "srr",         "card_count": 50, "opt": 1, "opt_subport": 2, "chain": null },
+    { "port": 3,  "label": "A3",  "pillar": "sr",          "card_count": 84, "opt": 1, "opt_subport": 3, "chain": null },
+    { "port": 4,  "label": "A4",  "pillar": "sr",          "card_count": 84, "opt": 1, "opt_subport": 4, "chain": null },
+    { "port": 5,  "label": "A5",  "pillar": "sr",          "card_count": 42, "opt": 1, "opt_subport": 5, "chain": null },
+    { "port": 6,  "label": "A6",  "pillar": "main_top",    "card_count": 87, "opt": 1, "opt_subport": 6, "chain": null },
+    { "port": 7,  "label": "A7",  "pillar": "main_top",    "card_count": 91, "opt": 1, "opt_subport": 7, "chain": null },
+    { "port": 8,  "label": "A8",  "pillar": "main_top",    "card_count": 52, "opt": 1, "opt_subport": 8, "chain": null },
+    { "port": 9,  "label": "A9",  "pillar": "sl",          "card_count": 84, "opt": 2, "opt_subport": 1, "chain": null },
+    { "port": 10, "label": "A10", "pillar": "sl",          "card_count": 84, "opt": 2, "opt_subport": 2, "chain": null },
+    { "port": 11, "label": "A11", "pillar": "sl",          "card_count": 42, "opt": 2, "opt_subport": 3, "chain": null },
+    { "port": 12, "label": "A12", "pillar": "sll",         "card_count": 76, "opt": 2, "opt_subport": 4, "chain": null },
+    { "port": 13, "label": "A13", "pillar": "sll",         "card_count": 50, "opt": 2, "opt_subport": 5, "chain": null },
+    { "port": 14, "label": "A14", "pillar": "dj_booth",    "card_count": 15, "opt": 2, "opt_subport": 6, "chain": null },
+    { "port": 15, "label": "A15", "pillar": "main_bottom", "card_count": 26, "opt": 2, "opt_subport": 7, "chain": null }
+  ],
+  "output_cards": [
+    {
+      "card_id": "O-5",
+      "role": "primary",
+      "slot": 5,
+      "opts": [
+        { "opt": 1, "ports": [1, 2, 3, 4, 5, 6, 7, 8] },
+        { "opt": 2, "ports": [9, 10, 11, 12, 13, 14, 15] }
+      ]
+    },
+    {
+      "card_id": "O-6",
+      "role": "backup",
+      "slot": 6,
+      "mirrors": "O-5",
+      "opts": [
+        { "opt": 3, "ports": [1, 2, 3, 4, 5, 6, 7, 8] },
+        { "opt": 4, "ports": [9, 10, 11, 12, 13, 14, 15] }
+      ]
+    }
+  ]
+}
