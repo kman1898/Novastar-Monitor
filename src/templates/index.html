@@ -3,8 +3,22 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NovaStar Monitor</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>NovaStar Monitor — Wall</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=20260808a">
+<!--
+  DEPLOYMENT RISK — socket.io client is loaded from a public CDN.
+  LED walls routinely run on isolated show networks with no internet route, and
+  there this script never loads. app.js detects the missing `io` global and
+  falls back to polling the REST endpoints, so the dashboard still works, but
+  live push updates are lost.
+  FIX: vendor socket.io-client 4.7.5 (socket.io.min.js) into src/static/js/ and
+  point this tag at url_for('static', filename='js/socket.io.min.js'). No copy
+  of the client ships with flask-socketio / python-socketio, so it has to be
+  fetched once from a machine that has internet and committed to the repo.
+-->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 </head>
 <body>
@@ -16,35 +30,47 @@
   <div class="topbar-right">
     <span id="topbar-info">Connecting...</span>
     <div class="pulse" id="pulse-dot"></div>
-    <button class="btn btn-sm" onclick="showAddDevice()">+ Add Device</button>
+    <button class="btn btn-sm" data-action="add-device-show">+ Add Device</button>
   </div>
 </div>
+
+<!-- Connection / degraded-mode banner -->
+<div id="conn-banner" class="connection-lost"></div>
 
 <!-- Add Device Modal -->
 <div id="add-device-modal" class="modal hidden">
   <div class="modal-content">
     <div class="modal-header">
       <span class="modal-title">Add NovaStar Device</span>
-      <button class="modal-close" onclick="hideAddDevice()">&times;</button>
+      <button class="modal-close" data-action="add-device-hide">&times;</button>
     </div>
     <div class="modal-body">
+      <label>Device Type</label>
+      <div class="filter-pills" id="add-type-filter" style="margin-bottom:12px;width:100%;">
+        <button class="pill active" data-type="h_series" data-port="5203">H-series (5203)</button>
+        <button class="pill" data-type="vx1000" data-port="5200">VX1000 family (5200)</button>
+        <button class="pill" data-type="custom" data-port="">Custom</button>
+      </div>
       <label>Device Name</label>
-      <input type="text" id="add-name" placeholder="Main Stage VX1000" class="input">
+      <input type="text" id="add-name" placeholder="Main Stage H-series" class="input">
       <label>IP Address</label>
       <input type="text" id="add-ip" placeholder="192.168.0.10" class="input">
       <label>Port</label>
-      <input type="number" id="add-port" value="5200" class="input">
+      <input type="number" id="add-port" value="5203" class="input">
+      <p style="font-size:11px;color:var(--text-muted);margin-top:-4px;">
+        Adding a device starts polling immediately at the configured interval (Settings → Poll Interval).
+      </p>
     </div>
     <div class="modal-footer">
-      <button class="btn" onclick="hideAddDevice()">Cancel</button>
-      <button class="btn btn-primary" onclick="addDevice()">Add Device</button>
+      <button class="btn" data-action="add-device-hide">Cancel</button>
+      <button class="btn btn-primary" data-action="add-device-submit">Add &amp; Start Polling</button>
     </div>
   </div>
 </div>
 
 <!-- Main Content -->
 <div class="container">
-  <!-- Stats Row -->
+  <!-- Stats Row — hidden on the Wall View tab, which has its own stats bar -->
   <div class="stats-grid" id="stats-grid">
     <div class="stat-card"><div class="stat-label">Devices</div><div class="stat-value color-muted">—</div></div>
   </div>
@@ -52,6 +78,7 @@
   <!-- Tabs -->
   <div class="tabs" id="tabs">
     <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="wall">Wall View</button>
     <button class="tab" data-tab="errors">Error Log <span class="tab-badge hidden" id="error-badge">0</span></button>
     <button class="tab" data-tab="settings">Settings</button>
   </div>
@@ -62,10 +89,44 @@
       <a href="/api/export/monitoring.csv" class="btn btn-sm" download>↓ Export Snapshot CSV</a>
     </div>
     <div id="devices-container">
-      <div class="section" style="text-align:center;padding:40px;">
-        <p class="color-muted">No devices configured.</p>
-        <p class="color-muted" style="margin-top:8px;">Click <strong>+ Add Device</strong> to start monitoring.</p>
+      <div class="section empty-state">
+        <div class="empty-state-icon">⊕</div>
+        <div class="empty-state-title">No devices configured</div>
+        <div class="empty-state-body">
+          Add your first NovaStar controller to begin monitoring.<br>
+          Or enable <strong>Simulation Mode</strong> in Settings to explore the UI without hardware.
+        </div>
+        <button class="btn btn-primary" style="margin-top:14px;" data-action="add-device-show">+ Add Device</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Wall View Tab -->
+  <div id="tab-wall" class="tab-content">
+    <div class="section">
+      <div class="section-title" style="flex-wrap:wrap;">
+        <span id="wall-name" style="font-size:16px;">Loading wall…</span>
+        <span class="badge badge-info" id="wall-card-count">— cards</span>
+      </div>
+
+      <!-- Wall controls row -->
+      <div class="wall-controls">
+        <span style="font-size:11px;color:var(--text-muted);">Color:</span>
+        <div class="filter-pills" id="wall-mode-filter">
+          <button class="pill active" data-val="temperature">Temp</button>
+          <button class="pill" data-val="power">Power</button>
+          <button class="pill" data-val="online">Online</button>
+        </div>
+      </div>
+
+      <!-- Aggregate stats bar (populated by wall_view.js) -->
+      <div id="wall-stats" class="wall-stats"></div>
+
+      <!-- The wall canvas (populated by wall_view.js) -->
+      <div id="wall-canvas-wrap"></div>
+
+      <!-- Color legend (populated by wall_view.js, follows the selected mode) -->
+      <div id="wall-legend" class="wall-legend"></div>
     </div>
   </div>
 
@@ -77,7 +138,7 @@
         <span class="badge badge-danger" id="active-error-count">0 active</span>
         <div style="margin-left:auto;display:flex;gap:6px;">
           <a href="/api/export/errors.csv" class="btn btn-sm" download>↓ Export CSV</a>
-          <button class="btn btn-sm" onclick="clearResolved()">Clear Resolved</button>
+          <button class="btn btn-sm" data-action="clear-resolved">Clear Resolved</button>
         </div>
       </div>
       <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
@@ -102,6 +163,18 @@
   <!-- Settings Tab -->
   <div id="tab-settings" class="tab-content">
     <div class="section">
+      <div class="section-title">
+        Configured Devices
+        <span class="badge badge-info" id="settings-device-count" style="margin-left:6px;">0</span>
+        <button class="btn btn-sm btn-primary" style="margin-left:auto;" data-action="add-device-show">+ Add</button>
+      </div>
+      <div id="settings-devices-list">
+        <p style="font-size:12px;color:var(--text-muted);text-align:center;padding:18px 0;">
+          No devices configured.
+        </p>
+      </div>
+    </div>
+    <div class="section">
       <div class="section-title">Alert Thresholds</div>
       <div class="info-grid" style="max-width:500px;">
         <div class="info-item">
@@ -117,21 +190,21 @@
           <input type="number" id="set-volt-min" class="input" step="0.1" value="4.7">
         </div>
         <div class="info-item">
-          <label>Poll Interval (seconds)</label>
-          <input type="number" id="set-poll-int" class="input" step="0.5" min="1" max="30" value="2">
+          <label>Poll Interval (seconds) — typical: 5–30</label>
+          <input type="number" id="set-poll-int" class="input" step="1" min="3" max="300" value="10">
         </div>
       </div>
-      <button class="btn btn-primary" style="margin-top:12px;" onclick="saveSettings()">Save Settings</button>
+      <button class="btn btn-primary" style="margin-top:12px;" data-action="save-settings">Save Settings</button>
       <span id="settings-saved" class="color-success" style="margin-left:10px;font-size:12px;display:none;">Saved ✓</span>
     </div>
     <div class="section">
       <div class="section-title">Simulation Mode</div>
-      <p style="font-size:12px;color:var(--muted);margin-bottom:10px;">
+      <p style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">
         Enable a simulated VX1000 with 14 receiving cards for UI testing without live hardware.
       </p>
       <div style="display:flex;align-items:center;gap:10px;">
         <label class="toggle-switch">
-          <input type="checkbox" id="demo-toggle" onchange="toggleSimulation(this.checked)">
+          <input type="checkbox" id="demo-toggle">
           <span class="toggle-slider"></span>
         </label>
         <span id="demo-status" style="font-size:13px;">Disabled</span>
@@ -147,6 +220,7 @@
   </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js') }}?v=20260808a"></script>
+<script src="{{ url_for('static', filename='js/wall_view.js') }}?v=20260808a"></script>
 </body>
 </html>
