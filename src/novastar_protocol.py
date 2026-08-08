@@ -15,7 +15,12 @@ UDP_DISCOVERY_PORT = 5600
 # Maximum receiving cards per output port (resolution-dependent).
 # At 60×120 panel resolution, the H-series supports up to 91 per port.
 H_MAX_CARDS_PER_PORT = 91
-H_MAX_PORTS = 15
+
+# Chains (output ports) addressable per sender card. §6.5: the per-card frame's
+# chain field (byte[7]) was observed spanning 0–15 on the H2 rig — 16 chains,
+# whose panel counts sum to the operator's known 245. The venue wall uses 15 of
+# them (A1–A15); port 16 is spare.
+H_MAX_PORTS = 16
 
 # ── VX1000 Register Addresses ────────────────────────────
 
@@ -28,13 +33,11 @@ REG_GAMMA           = (0x07000000, 0x0200)  # Gamma mode (2 bytes)
 REG_DATETIME        = (0x16000000, 0x0800)  # Date/time (8 bytes)
 REG_VIDEO_STATUS    = (0x00000002, 0x0002)  # Video/input status (512 bytes)
 REG_LIVE_MONITOR    = (0x0000000a, 0x5200)  # Live monitoring data (~82 bytes)
-REG_PORT_INFO       = (0x01000113, 0x0100)  # Port hardware info
-REG_CARD_CONFIG     = (0x9E000013, 0x0200)  # Receiving card config
 
 # ── H-Series Register Addresses ──────────────────────────
 # Decoded from H-series Wireshark captures on port 5203.
 # The H-series uses the same frame format but different registers
-# and a multi-port architecture (up to 15 output ports, each
+# and a multi-port architecture (up to 16 chains per sender card, each
 # with its own daisy-chain of receiving cards).
 
 H_REG_VIDEO_STATUS  = (0x00000002, 0x0002)  # 512 bytes — byte[1]=link, byte[31]=port bitmask
@@ -44,66 +47,36 @@ H_REG_BRIGHTNESS    = (0x06000000, 0x0100)  # 1 byte — brightness 0-255
 H_REG_GAMMA         = (0x07000000, 0x0200)  # 2 bytes — gamma mode
 H_REG_DATETIME      = (0x16000000, 0x0800)  # 8 bytes — date/time
 H_REG_DEVICE_ID     = (0x00000005, 0x0002)  # 512 bytes — NSSD device identity
-H_REG_FPGA_FW       = (0x00000008, 0x0002)  # 512 bytes — FPGA firmware per card
-H_REG_MCU_FW        = (0x00000009, 0x0002)  # 512 bytes — MCU firmware per card
 
 # Per-card data channels: 0x00400003 through 0x004E0003 (8 channels).
-# Channel 0 (0x00400003): byte[0] / 2.0 = temperature in Celsius.
+# Each returns 512 bytes per card. Originally believed channel 0 byte[0]/2.0
+# was temperature, but cross-referencing with NovaLCT MonitorSite GUI proved
+# the value is a constant (0x5D across all 943 cards) — purpose unknown.
+# Real per-card temperature lives in REG_LIVE_MONITOR (0x0000000A) byte[1]/2.0,
+# the same VX1000-style register, which works on H-series too.
+# Channels 1-7 (0x00420003–0x004E0003) are still undecoded research targets;
+# kept here as the base address for that work.
 H_REG_CARD_DATA_BASE = 0x00400003
 H_REG_CARD_DATA_LEN  = 0x0002  # 512 bytes per channel
 
+# Per-card fault/alarm flag — single byte, 0 = no fault.
+# Confirmed from capture: 943 cards all returned 0x00 while NovaLCT GUI
+# showed "Quantity of fault: 0". Non-zero values would indicate active
+# alarms (specific fault code semantics not yet captured).
+H_REG_CARD_FAULT     = (0x09050002, 0x0100)  # 1 byte
 
-def per_card_address(card_index):
-    """Register address for a specific receiving card (1-based index)."""
-    return 0x00002013 | ((card_index * 0x10) << 16)
-
-
-def h_card_data_register(channel):
-    """H-series per-card data channel register (0-based, 0-7).
-
-    Channel 0 = 0x00400003 (temperature in byte[0])
-    Channel 1 = 0x00420003
-    ...
-    Channel 7 = 0x004E0003
-    """
-    addr = H_REG_CARD_DATA_BASE + (channel * 0x00020000)
-    return (addr, H_REG_CARD_DATA_LEN)
-
-
-def h_port_video_register(port_num):
-    """H-series per-port video status register.
-
-    Port 1 = 0x00010002, Port 2 = 0x00020002, etc.
-    Returns 512 bytes when the port is connected.
-    """
-    addr = 0x00000002 + (port_num << 16)
-    return (addr, 0x0002)
+# Per-card bit-error counter — 3-byte response (§6.5, decoded from
+# `H series Bit errors detection.pcapng`). Length 0x0300 is byte mode:
+# high byte = 3, low byte = 0 → decode_length(0x0300) == 3.
+# NovaLCT polls this ~10x more often than any other register; it is the only
+# continuous data-integrity signal and has no JSON UDP equivalent.
+H_REG_BIT_ERRORS     = (0x4A010002, 0x0300)  # 3 bytes
 
 
 # ── Length Encoding ───────────────────────────────────────
 # The 16-bit length field in NovaStar frames uses a split encoding:
 #   If low byte != 0 → payload = low_byte × 256 bytes  (page mode)
 #   If low byte == 0 → payload = high_byte bytes        (byte mode)
-
-def encode_length(byte_count):
-    """Encode a payload byte count into the 16-bit wire format.
-
-    >>> encode_length(1)    # 1 byte  → 0x0100
-    256
-    >>> encode_length(512)  # 512 bytes → 0x0002
-    2
-    """
-    if byte_count <= 0:
-        return 0
-    if byte_count % 256 == 0:
-        pages = byte_count // 256
-        if pages <= 255:
-            return pages  # low byte = pages, high byte = 0
-    if byte_count <= 255:
-        return byte_count << 8  # high byte = count, low byte = 0
-    # Fallback: can't encode exactly, use page mode rounded up
-    return (byte_count + 255) // 256
-
 
 def decode_length(length_field):
     """Decode the 16-bit wire length field to actual payload byte count.
@@ -124,42 +97,69 @@ def decode_length(length_field):
 
 # ── Frame Building ────────────────────────────────────────
 
-def checksum(data):
-    return sum(data) & 0xFFFF
+# Checksum formula (per VX1000 Control Protocol V1.0 §3.2.1 and Sending Card
+# Central Control Protocol V1.3 §4.1):
+#
+#   SUM = sum(bytes_between_header_and_checksum) + 0x5555
+#
+# The 0x55 0xAA frame header is NOT included in the sum. The 16-bit result is
+# wire-encoded little-endian (SUM_L first, SUM_H second).
+#
+# Worked example from VX1000 doc: reading ModeID
+#   Wire:    55 aa 00 00 fe 00 00 00 00 00 00 00 02 00 00 00 02 00 57 56
+#   Body:          00 00 fe 00 00 00 00 00 00 00 02 00 00 00 02 00
+#   sum(body) = 0x102, +0x5555 = 0x5657, little-endian wire = 57 56 ✓
+
+
+def checksum(body):
+    """Compute the 16-bit NovaStar frame checksum.
+
+    `body` is the slice of frame bytes between the 2-byte header and the
+    2-byte checksum field. The header (0x55 0xAA / 0xAA 0x55) is excluded.
+    """
+    return (sum(body) + 0x5555) & 0xFFFF
+
+
+def _frame(body):
+    """Wrap a body with the request header and little-endian checksum."""
+    return struct.pack(">H", HEADER_REQUEST) + body + struct.pack("<H", checksum(body))
 
 
 def build_read(seq, register, length, device=0xFE, port=0x00):
     """Build a 20-byte READ request frame (broadcast / sending-card target)."""
-    frame = struct.pack(">HHBB6xIH", HEADER_REQUEST, seq, device, port, register, length)
-    frame += struct.pack(">H", checksum(frame))
-    return frame
+    body = struct.pack(">HBB6xIH", seq, device, port, register, length)
+    return _frame(body)
 
 
-def build_read_card(seq, register, length, card_index, device=0xFE, port=0x00):
-    """Build a 20-byte READ request targeting a specific receiving card.
+def build_read_card(seq, register, length, chain, card_index,
+                    device=0xFE, port=0x00):
+    """Build a 20-byte READ request targeting one card on one chain.
 
-    Per-card addressing (confirmed from VX1000 Wireshark captures):
-      byte[6] = 0x01  (direct-to-receiving-card command)
-      byte[7] = 0x00
-      byte[8] = card_index  (0-based, 0x00–0x0D for 14 cards)
-      bytes[9-11] = 0x00 0x00 0x00
+    Per-card addressing (H_SERIES_FINDINGS §6.5 — decoded from
+    `H series Bit errors detection.pcapng`, a single-sender-card H2 rig whose
+    known 245-panel count is reproduced exactly by counting distinct
+    (byte[7], byte[8]) pairs across 16 chains):
+      byte[5]  = OPT group (`port` kwarg) — 0x00 in all observed traffic
+      byte[6]  = 0x01  (per-card marker; 0x00 would be a broadcast read)
+      byte[7]  = chain index, 0-based (0–15, 16 chains per sender card)
+      byte[8]  = card position within that chain, 0-based
+      byte[9]  = card index high byte — 0x00 in all observed traffic
+      bytes[10-11] = 0x00 0x00
+
+    Intended call pattern: open one TCP connection per sender card (§6.5 maps
+    them to TCP 5201/5202/5203, with 5200 as the broadcast/main controller),
+    then walk `chain` 0–15 and `card_index` 0–N on that connection:
+
+        build_read_card(seq, reg, length, chain, card_index)
+
+    The chain is NOT the `port` kwarg. `port` is the OPT group in byte[5] and
+    stays 0 unless a capture proves otherwise — passing a chain number there
+    (the pre-§6.5 mistake) addresses the wrong thing entirely.
     """
-    frame = struct.pack(">HHBB", HEADER_REQUEST, seq, device, port)
-    frame += bytes([0x01, 0x00, card_index & 0xFF, 0x00, 0x00, 0x00])
-    frame += struct.pack(">IH", register, length)
-    frame += struct.pack(">H", checksum(frame))
-    return frame
-
-
-def build_write(seq, register, payload, device=0xFE, port=0x00,
-                target=b"\xFF\xFF\xFF", target_port=0x01):
-    """Build a WRITE command frame."""
-    frame = struct.pack(">HHBBB3sBxIH",
-        HEADER_REQUEST, seq, device, port, 0x01,
-        target, target_port, register, len(payload))
-    frame += payload
-    frame += struct.pack(">H", checksum(frame))
-    return frame
+    body = struct.pack(">HBB", seq, device, port)
+    body += bytes([0x01, chain & 0xFF, card_index & 0xFF, 0x00, 0x00, 0x00])
+    body += struct.pack(">IH", register, length)
+    return _frame(body)
 
 
 def parse_response(data):
@@ -254,22 +254,36 @@ def parse_nssd(data):
 
 # ── H-Series Data Parsing ────────────────────────────────
 
+# Byte[31] of the broadcast video status register is a SINGLE byte, so it can
+# only carry 8 bits — it measures 8 chains, not the 16 a sender card addresses
+# per §6.5. No capture shows a second bitmask byte anywhere in the register, so
+# chains 9-16 are simply not covered by this signal. Reporting them as False
+# would fabricate a "disconnected" reading for chains that were never measured,
+# so parse_h_port_bitmask omits them from its result instead. For chains above
+# 8, use the per-card signals (parse_h_card_link / parse_live_monitoring's
+# link_status), which §2.3 lists as the other two data-break detection layers.
+H_PORT_BITMASK_BITS = 8
+
 
 def parse_h_port_bitmask(video_status_data):
     """Extract port connection bitmask from H-series broadcast video status.
 
     Byte[31] of the broadcast video status register (0x00000002) contains
     a bitmask where each bit represents a connected output port.
-    Bit 0 = port 1, bit 1 = port 2, ..., bit 14 = port 15.
+    Bit 0 = port 1, bit 1 = port 2, ..., bit 7 = port 8.
 
-    Returns dict mapping port numbers (1-15) to connected (bool).
+    Returns dict mapping port numbers (1-8 only — see H_PORT_BITMASK_BITS) to
+    connected (bool). Ports above 8 are absent from the dict rather than False.
     Decoded from H-series Wireshark captures: 0xAF (6 ports connected)
     changed to 0xAC when ports 1 and 2 were physically disconnected.
     """
     if not video_status_data or len(video_status_data) < 32:
         return {}
     bitmask = video_status_data[31]
-    return {port: bool(bitmask & (1 << (port - 1))) for port in range(1, H_MAX_PORTS + 1)}
+    return {
+        port: bool(bitmask & (1 << (port - 1)))
+        for port in range(1, H_PORT_BITMASK_BITS + 1)
+    }
 
 
 def parse_h_card_link(video_status_data):
@@ -286,31 +300,68 @@ def parse_h_card_link(video_status_data):
     return (connected, 7)
 
 
+# !!! DEPRECATED — DO NOT CALL FOR TEMPERATURE !!!
+# Register 0x00400003 returns the constant 0x5D on every card. The function
+# below is retained only so historical callers don't crash; any new per-card
+# thermal reading must come from parse_live_monitoring() on REG_LIVE_MONITOR.
 def parse_h_card_temperature(card_data_payload):
-    """Parse temperature from H-series per-card data channel 0.
+    """DEPRECATED — register 0x00400003 is NOT per-card temperature.
 
-    Register 0x00400003, byte[0] / 2.0 = temperature in Celsius.
-    Confirmed from capture: all cards returned 0x5D (93) = 46.5°C.
+    DO NOT USE THIS FOR TEMPERATURE. It returns a constant, not a reading.
+
+    Originally assumed the H-series per-card data channel 0 carried temperature
+    via byte[0]/2.0. Cross-referencing 943-card capture against the NovaLCT
+    MonitorSite GUI proved every card returns the constant 0x5D regardless of
+    actual thermal state. The real per-card temperature lives in the VX1000-style
+    REG_LIVE_MONITOR (0x0000000A) byte[1]/2.0; use parse_live_monitoring() for
+    the H-series too.
+
+    This function is kept (returns the raw byte/2.0) only so any historical
+    callers don't break, but do not treat its output as temperature.
     """
     if not card_data_payload or len(card_data_payload) < 1:
         return None
     return card_data_payload[0] / 2.0
 
 
-def parse_h_system_info(data):
-    """Parse H-series per-card system info register (0x00000000).
+def parse_h_card_fault(fault_payload):
+    """Parse the per-card fault/alarm flag from H-series register 0x09050002.
 
-    Returns hardware type and firmware version info.
-    byte[0] = HW type (e.g., 0x09 for A8s receiving cards)
-    bytes[1:10] = firmware version components
+    Returns dict with `fault` (bool) and `code` (raw byte, 0–255).
+    `fault` is True when any non-zero code is present.
+
+    Confirmed from `H series Monitioring Fault and temp readings.pcapng`:
+    all 943 cards returned 0x00 while NovaLCT GUI showed "Quantity of fault: 0".
+    Specific non-zero fault code semantics are not yet decoded — needs a capture
+    taken while a card has an active hardware alarm.
     """
-    if not data or len(data) < 10:
+    if not fault_payload or len(fault_payload) < 1:
         return None
+    code = fault_payload[0]
+    return {"fault": code != 0, "code": code}
+
+
+def parse_bit_errors(payload):
+    """Parse the per-card bit-error counter from H-series register 0x4A010002.
+
+    Returns dict with `present` (bool), `errors` (int), `saturated` (bool) and
+    the raw `status` byte, or None if the payload is missing or short.
+
+    Layout per §6.5, decoded from `H series Bit errors detection.pcapng`:
+      byte[0]    = status; 0x05 = card present/responding
+      bytes[1-2] = bit error count, uint16 LITTLE-endian (0–65535)
+
+    `0xFFFF` is the counter's ceiling, reported as `saturated` — it means a
+    serious data-integrity fault rather than a literal 65535 errors. The
+    healthy-rig baseline in the capture is `05 00 00` (present, zero errors).
+    """
+    if not payload or len(payload) < 3:
+        return None
+    status = payload[0]
+    errors = struct.unpack("<H", payload[1:3])[0]
     return {
-        "hw_type": f"0x{data[0]:02X}",
-        "fpga_major": data[1],
-        "fpga_minor": data[2],
-        "fw_revision": data[3],
-        "fw_sub": data[4],
-        "version_bytes": data[5:10].hex(),
+        "present": status == 0x05,
+        "status": status,
+        "errors": errors,
+        "saturated": errors == 0xFFFF,
     }
