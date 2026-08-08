@@ -1,0 +1,5 @@
+{
+  "layout_name": "default",
+  "description": "Default view: render every pillar at its H-series canvas coordinate (no overrides).",
+  "pillar_overrides": {}
+}
