@@ -20,7 +20,7 @@ fi
 echo ""
 echo "  NovaStar Monitor"
 echo "  ════════════════"
-echo "  Open http://127.0.0.1:8050 in your browser"
+echo "  Open http://127.0.0.1:8060 in your browser"
 echo ""
 
 python3 app.py

@@ -18,3 +18,14 @@ logs/
 Thumbs.db
 *.pcapng
 settings.json
+.pytest_cache/
+.claude/settings.local.json
+
+# Runtime state — per-install, generated at run time, never source.
+# These hold site-specific data (controller IPs, live alert history, and a
+# per-wall receiving-card inventory) and must not be committed.
+src/novastar_settings.json
+src/error_log.json
+src/wall_config.json
+src/wall_layout.json
+src/wall_live_snapshot.json
