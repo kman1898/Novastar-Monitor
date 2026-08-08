@@ -20,6 +20,11 @@ a = Analysis(
         ('templates', 'templates'),
         ('static', 'static'),
         ('VERSION.txt', '.'),
+        # Bundled wall topology defaults. wall_config.load_config() reads these
+        # from BASE_DIR when no per-install override exists in APP_DIR; without
+        # them a frozen build raises FileNotFoundError on the wall endpoints.
+        ('wall_config_default.json', '.'),
+        ('wall_layout_default.json', '.'),
     ],
     hiddenimports=[
         'flask',
@@ -30,6 +35,8 @@ a = Analysis(
         'app',
         'device_manager',
         'novastar_protocol',
+        'h_series_json',
+        'wall_config',
         'launcher_settings',
         'demo_device',
     ],
@@ -79,8 +86,8 @@ if system == 'Darwin':
         info_plist={
             'CFBundleName': 'NovaStar Monitor',
             'CFBundleDisplayName': 'NovaStar Monitor',
-            'CFBundleVersion': '0.3.0',
-            'CFBundleShortVersionString': '0.3.0',
+            'CFBundleVersion': '0.4.0',
+            'CFBundleShortVersionString': '0.4.0',
             'LSUIElement': True,  # Hide from Dock (menu bar app)
         },
     )

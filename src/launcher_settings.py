@@ -19,7 +19,7 @@ SETTINGS_FILE = os.path.join(APP_DIR, 'settings.json')
 
 DEFAULT_SETTINGS = {
     'interface': '127.0.0.1',
-    'port': 8050,
+    'port': 8060,
     'start_minimized': False,
     'run_at_login': False,
     'auto_open_browser': True,
