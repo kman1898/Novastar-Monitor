@@ -48,15 +48,17 @@ H-series chassis
 >
 > The `byte[5]=port` claim in the table below is **wrong** and was implemented
 > from this section once already, costing real time. The verified layout is
-> **byte[7] = chain index, byte[8] = card position**, with one TCP connection
-> per sender card. §6.5 supersedes this table; it is kept only because the
-> JSON row is still accurate and because the wrong model appears in old
-> captures and old code.
+> **byte[5] = sender card index, byte[7] = chain index, byte[8] = card
+> position**, over a SINGLE connection to TCP 5201 — not one connection per
+> sender card, which is a second wrong model that also cost time (5202/5203/
+> 5204 accept connections and answer every read with an empty payload). §6.5
+> supersedes this table; it is kept only because the JSON row is still
+> accurate and because the wrong models appear in old captures and old code.
 
 | Form | How slot/port/card are encoded |
 |---|---|
 | **JSON UDP `R0155`** | `param0=slotId`, `param1=portId`, `param2=cardId_low_byte`, `param3=cardId_high_byte` (16-bit card_id split low/high). **Caveat:** this path silently under-reports — see §6.6. |
-| **Binary TCP** | ~~`byte[5]=port` … `byte[8]=card_index`~~ **SUPERSEDED — see §6.5.** Correct: `byte[7]=chain`, `byte[8]=card position`, one TCP connection per sender card (5201/5202/5203). Implemented in `build_read_card()` in [src/novastar_protocol.py](src/novastar_protocol.py). |
+| **Binary TCP** | ~~`byte[5]=port` … `byte[8]=card_index`~~ **SUPERSEDED — see §6.5.** Correct: `byte[5]=sender card`, `byte[7]=chain`, `byte[8]=card position`, all over one connection to TCP 5201. Implemented in `build_read_card()` in [src/novastar_protocol.py](src/novastar_protocol.py). |
 
 The wall documented in this section is **943 panels/cards** (sum of A1–A15 chain
 card counts) on a single sender card. That is *not* the same wall as the
@@ -189,7 +191,7 @@ The 0x55 0xAA frame header is **not** included in the sum. Verified against work
 | **Fault / Alarm** | Card-level hardware alarm (temp out of range, voltage anomaly, hardware error) | per-card | `0x09050002` byte[0] | needs new `parse_h_card_fault()` | partially — confirmed 0=OK; non-zero fault codes need a real fault to be triggered |
 | **Data break** | Video signal interrupted between cards (cable pull / broken link / fiber disconnect) | per-port + per-card | `0x00000002` byte[31] (port bitmask) **AND** `0x0000000A` byte[12] (per-card link status) | `parse_h_port_bitmask()` + `parse_live_monitoring()['link_status']` | ✅ validated in `Basic Reading with backup.pcapng` — pulling primary cables on chain ports 1+2 changed bitmask from `0xAF` → `0xAC` (bits 0,1 cleared) |
 
-**Voltage** (also from `0x0000000A` byte[3] × 0.03) belongs alongside Temperature as continuous per-card telemetry.
+**Voltage** (also from `0x0000000A` byte[3], decoded as `(byte & 0x7F) × 0.1` — see "Voltage formula" below) belongs alongside Temperature as continuous per-card telemetry.
 
 ### Three layers of data break detection (all H-series binary protocol)
 
@@ -344,7 +346,7 @@ In rough priority order, files to read first when picking up this work:
 `H series Bit errors detection.pcapng` + `H series More.pcapng` (a single-card
 H2 test rig that should report exactly 245 panels — and does, with this model).
 
-### Sender-card → TCP port mapping (from UDP 3800 `rqProMI:` discovery)
+### Sender-card selection — CORRECTED 2026-08-09 (byte[5], not the TCP port)
 
 The device answers a `"rqProMI:"` broadcast on UDP 3800 with:
 
@@ -352,17 +354,140 @@ The device answers a `"rqProMI:"` broadcast on UDP 3800 with:
 rpProMI:App,0161 H_SUB_CARD@^^@5201 H_SUB_CARD@^^@5202 H_SUB_CARD@^^@5203
 ```
 
-→ Each **sender card is its own TCP service**:
+It is tempting to read that as one TCP service per sender card. **It is not.**
+Tested against a live two-sender H15: 5202/5203/5204 accept the connection and
+then answer *every* read with an **empty payload**. Enumerating them as
+separate services is why sender cards 2+ came back with zero cards on every
+chain.
 
-| TCP port | Target |
-|---|---|
-| 5200 | main controller / broadcast |
-| 5201 | sender card 1 (`H_SUB_CARD`) |
-| 5202 | sender card 2 |
-| 5203 | sender card 3 |
+The sender card is selected by **byte[5] of the read frame**, over the one
+connection to **TCP 5201**:
 
-To enumerate a multi-card chassis (e.g. COSMIC MEADOW's 3 cards), open a
-separate TCP connection to **each** of 5201/5202/5203.
+```
+tcp 5201  byte[5]=0  chain 0 card 0  →  05 00 00   sender card 1 (slot 20, fw V4.5.1.81)
+tcp 5201  byte[5]=1  chain 0 card 0  →  05 03 00   sender card 2 (slot 22, fw V4.8.1.4)
+tcp 5201  byte[5]=2  chain 0 card 0  →  a7 56 00   absent
+tcp 5201  byte[5]=3  chain 0 card 0  →  a8 56 00   absent
+```
+
+Same address, different sender card, different card behind it — the second one
+carrying 3 bit errors while the first has none. byte[5] is therefore the
+**sender card index**, not the "OPT group" the earlier table called it. The OPT
+group is already implied by the chain (0–7 = OPT 1, 8–15 = OPT 2), so it never
+needed a byte of its own. Every capture that read byte[5] as a constant 0x00
+came from the single-sender H2 rig, where it is.
+
+`--sender-cards N` numbers are 1-based; the wire byte is `N-1`.
+
+### Sender card numbering: derive it from the SLOT, never from discovery
+
+```
+card_number = (slot - 20) / 2 + 1        byte[5] = card_number - 1
+```
+
+Output cards occupy every second chassis slot from 20, so slots 20, 22, 28, 30
+are cards **1, 2, 5, 6** — which is exactly what the operator calls them.
+
+The `rqProMI` reply advertises services on 5201-5204. Reading those as "cards
+1, 2, 3, 4" is wrong on any chassis with backups in higher slots, and it is a
+silent wrongness: `enumerate_wall.py` scanned `byte[5]` 0-3 and **never probed
+cards 5 and 6 at all**. An idle backup answers nothing either way, so the
+result looked correct — right up until a failover, which is the exact moment
+the data matters. Take the card numbers from the controller's slot list.
+
+### What a data break actually looks like (operator-verified, cable pulled)
+
+The operator pulled the cable at panel 12 of a 22-panel chain (sender card 1,
+OPT 1 port 4) twice. It produced **two completely different signatures**, and a
+monitoring tool has to recognise both.
+
+**A — the backup is carrying the tail.** Every panel still answers. Probing
+the primary and the backup separately shows the chain split at the break:
+
+```
+card 1 (slot 20, PRIMARY)  panels 1-22:  PPPPPPPPPPP...........
+card 5 (slot 28, BACKUP)   panels 1-22:  ...........PPPPPPPPPPP   <- 5 bit errors each
+```
+
+The primary feeds up to the break, the backup feeds from the far end, and
+together they cover all 22 — which is why the wall stays lit and why **"all
+cards online" is not evidence of a healthy wall**. The backup's panels carry a
+non-zero bit-error count; the primary's are clean.
+
+Probed through the primary alone, the same fault reads as every panel present
+with errors from 12 onward:
+
+```
+panels  1-11 : 0        panel 12 : 2        panels 13-22 : 2
+```
+
+**B — nothing is carrying it.** The chain simply stops:
+
+```
+panels  1-11 : present, 0 errors        panels 12-22 : no answer at all
+```
+
+Signature B is only distinguishable from an empty chain — or from a throttled
+controller (§6.6) — **against the known inventory**. A control chain probed in
+the same pass still answering its full length is what rules out the controller
+having stopped talking to us.
+
+In both signatures the **first affected panel is the break point**: errors
+propagate downstream because each card repeats to the next. A single card with
+errors and clean cards after it is one bad card, not a break, and reporting it
+as one sends someone to the wrong end of a cable run.
+
+Implemented in `NovaStar_Device.detect_chain_breaks`.
+
+### Clearing the bit-error counters (the one write this app makes)
+
+Captured from NovaLCT in `Bit error 4x clear erros.pcapng`, where the operator
+clicked clear four times and NovaLCT sent four frames identical but for the
+sequence number:
+
+```
+55 aa 00 ca fe ff 01 ff ff ff 01 00 76 00 00 01 01 00 05 98 5b
+```
+
+Register `0x76000001`, one payload byte `0x05`, broadcast (`byte[5] = 0xFF`,
+target `FF FF FF`) so it clears every card on every chain of every sender card
+at once. The register appears nowhere else in the 434 request frames of that
+capture. `build_clear_bit_errors()` reproduces all five captured frames
+byte-for-byte.
+
+The counter is cumulative and this is the only known way to reset it, so
+clearing discards evidence of an intermittent link for whoever looks next.
+`set_bit_error_baseline()` is the non-destructive alternative: it zeroes the
+displayed number and leaves the hardware counter alone.
+
+### Sender slots: R0405 is right, R0155 only answers for the active ones
+
+R0405 on the H15 lists slots **20, 22, 28, 30**, and all four are sender cards
+— **two primary and two backup** (operator-confirmed). What differs is which
+ones answer:
+
+| Slot | R0155 | Binary per-card read | Role |
+|---|---|---|---|
+| 20 | answers | 250 cards across 7 chains | primary |
+| 22 | answers | 36 cards across 2 chains | primary |
+| 28 | silent | `byte[5]=2` → absent | backup |
+| 30 | silent | `byte[5]=3` → absent | backup |
+| 21, 23 | `ack: "Error"` | — | not slots |
+
+A backup answers nothing on either protocol until it takes over, so an
+enumeration legitimately finds cards behind only two of the four. **Do not read
+that as "only two sender cards exist"** — an earlier version of this document
+said exactly that, and it is wrong.
+
+Which of the four is backing up which has **not** been established from the
+device; the pairing above is inferred from slot order alone. The controller
+does not appear to expose a primary/backup flag anywhere we have looked, which
+is the subject of a question to NovaStar.
+
+Practical consequence for the dashboard: "sender cards installed" (4, from
+R0405) and "sender cards carrying panels" (2, from the inventory) are different
+numbers and both are worth showing. A drop in the second without a change in
+the first is a failover or a dead fibre.
 
 ### Per-card request frame layout (20-byte read)
 
@@ -370,7 +495,7 @@ separate TCP connection to **each** of 5201/5202/5203.
 offset 0-1   55 AA            header
 offset 2-3   seq (BE)
 offset 4     FE               device (broadcast)
-offset 5     OPT group        usually 0x00 (rarely used)
+offset 5     SENDER CARD      ← byte5: 0-based sender card index
 offset 6     01               per-card marker (00 = broadcast read)
 offset 7     CHAIN index      ← byte7: which chain/sub-port (0..15)
 offset 8     CARD index       ← byte8: card position within that chain (0..N)
@@ -434,24 +559,180 @@ failure truncates discovery downstream of the break.
 
 ## 6.6 · Later corrections (supersede anything earlier that conflicts)
 
-### Voltage formula — was wrong, caused real false alarms
+### Register `0x0000000A` is NOT per-card on H-series — never enumerate with it
 
-**Correct: `raw * 0.03`.** Not `(raw & 0x7F) / 10`.
+On VX1000 it is the live-monitoring register. On H-series it answers for
+**every** `(chain, card)` address, occupied or not, with a free-running
+counter — successive probes return `6f 56 00…`, `75 56 00…`, `76 56 00…`
+regardless of which address was asked about. The absent marker is
+distinguishable only against the bit-error register:
 
-Same encoding as binary register `0x0000000A` byte[3] (`parse_voltage()` in
-`novastar_protocol.py`, documented in `docs/VX1000_Protocol_Analysis.md`).
-
-Evidence from the 1374-card snapshot: raw values span **165–173**.
-
-| Formula | Result | Verdict |
+| Address | `0x4A010002` (biterr) | `0x0000000A` (live) |
 |---|---|---|
-| `(raw & 0x7F) / 10` | 3.7–4.5 V | **every card** below the app's own 4.7 V alarm |
-| `raw * 0.03` | 4.95–5.19 V | a healthy 5 V rail |
+| chain 6 card 21 (real card) | `05 00 00` present | `?? 56 00` |
+| chain 6 card 22 (empty) | `d7 56 00` **absent** | `?? 56 00` |
+| chain 15 card 0 (empty chain) | `b4 56 00` **absent** | `?? 56 00` |
 
-The masked form silently subtracts 12.8 units (the high bit is never clear in
-the data). It produced a stream of `Voltage 4.25V below minimum threshold of
-4.7V` alerts against a completely healthy wall. Decoded by
-`h_series_json.parse_receiving_card()`; `device_manager` no longer duplicates it.
+Because "returned a well-formed payload" is the only presence test `0x0000000A`
+supports, a walk using it never finds a boundary — the only thing that ends a
+chain is a **timeout**, so the reported chain length measures controller load.
+That produced 7, then 9, then 22 cards on the same 22-card chain across three
+runs. `enumerate_wall.py` now refuses `--probe-register live` outright.
+
+Use `0x4A010002`: `byte[0] == 0x05` means present, anything else absent.
+
+### Register `0x0000000A` IS per-card — earlier entry in this doc was wrong
+
+An earlier revision of §6.6 said this register "answers for every address with
+a free-running counter" and should never be used for enumeration. That was a
+mistake in the probe, not in the device: the read was issued with length
+`0x0010`, which `decode_length` expands to **4096 bytes**, so every reply was
+misframed and the bytes being examined were garbage. The "counter" was the low
+bits of a status byte read at the wrong offset.
+
+Read correctly (length `0x5200` = 82 bytes) it is the most useful register on
+the device. One read per card returns:
+
+| Offset | Meaning |
+|---|---|
+| `byte[0]` | presence — `0x80` present, bit `0x40` set = nothing at this address |
+| `byte[1] / 2` | temperature °C (units of 0.5 °C — vendor §4.3.4) |
+| `(byte[3] & 0x7F) × 0.1` | voltage (lower 7 bits, units of 0.1 V — vendor §4.3.4 / §5.4.2) |
+| `byte[12]` | link status |
+
+Verified twice, independently:
+
+- **NovaLCT capture** (`Monitoring.pcapng`): NovaLCT polls this register once
+  for each of the wall's 286 cards, and `byte[1]/2` reproduces the operator's
+  stated 36–43 °C across all of them (7 cards at 36, 4 at 43, peak at 38).
+- **Live hardware**, on a chain known to hold exactly 22 panels: cards 0–21
+  answered `0x80`; cards 22–25 answered `0xC0/0xE0/0xE2/0xE4/0xE6`.
+
+**The trap that caused the original misreading:** an absent address still
+returns a well-formed 82-byte payload carrying the PREVIOUS card's temperature
+and voltage. "The device answered" is therefore not a presence test, and any
+decoder that skips the byte[0] mask invents a plausible panel for every empty
+address on the wall. Mask with `(b0 & 0xC0) == 0x80`.
+
+Practical consequence: this is now the default enumeration register and the
+app's whole-wall read. R0155 answers roughly 150 cards before the controller
+stops (§6.6), which left 250 of 286 panels with no readings; the binary
+register covers every card in one pass and yields link status as well.
+
+### `byte[12]` link status: 1 and 11 both mean working
+
+The VX1000 mapping is 1 = PRIMARY, 2 = BACKUP. On H-series `byte[12]` also
+takes other values: the NovaLCT capture of a healthy 286-card wall showed 1 on
+162 cards and **11 on the other 124**, and whole chains that are working
+normally report 11. Mapping "anything else" to DISCONNECTED therefore labelled
+124 healthy panels as disconnected. Only `0` is treated as disconnected now;
+anything unrecognised is `UNKNOWN`. What 11 actually means is undecoded.
+
+### `powerNStatus` non-zero does NOT mean a failed supply
+
+`0 = healthy` held up. `non-zero = failed` did not. Fifteen cards reported
+`power0Status: 1` **and** `power1Status: 1` while simultaneously reporting
+41–42 °C and 4.0–4.1 V over R0155. A card cannot measure and transmit its own
+temperature through a failed primary supply — it is powered and talking. Read
+as "both supplies failed", it raised a warning every polling cycle on a lit,
+healthy wall.
+
+Most likely it means a supply that is not fitted or not monitored on that
+panel model; panels with a single PSU still have two status fields. Until
+NovaStar confirms it, non-zero is reported as **unknown**, never as a fault,
+and the raw values are kept for later.
+
+### Silence is not absence — two separate causes, both truncated the wall
+
+An enumeration walk ends a chain at the first address the device says is
+empty. On this hardware "says is empty" and "says nothing" are easy to
+conflate, and both of the following silently under-reported the wall. Neither
+fails loudly; both produce plausible numbers.
+
+**Cause 1 — an empty address answers more slowly than an occupied one.**
+The controller has to wait out its own read to a card that isn't there. At a
+0.5 s socket timeout **every chain on the wall ended on a timeout** rather than
+on the device's answer; at 1.5 s they end on a real answer. `enumerate_wall.py`
+now defaults `DEFAULT_PROBE_TIMEOUT = 1.5`.
+
+**Cause 2 — the controller degrades over a long sweep.** After an unbatched
+R0155 sweep (~3000 requests) it stopped answering R0155 **entirely**, and
+recovered only after ~40–50 s of quiet:
+
+```
+t+0s silent   t+10s silent   t+20s silent   t+30s silent   t+40s ok   t+50s ok
+```
+
+The binary path degrades the same way, progressively rather than all at once.
+Chain 6 of the test wall has 22 cards. Probed on a rested device it reads 22
+every time. Reached ~200 probes into a full sweep it read 7, then 9, then —
+once pacing and rest-and-retry were added — 21:
+
+| Conditions | chain 6 reads |
+|---|---|
+| rested, single chain | **22** (correct) |
+| full sweep, 0.5 s timeout, no pacing | 7, then 9 |
+| full sweep, paced 0.15 s, 1.5 s timeout, 2 × 10 s rests | 21 |
+
+Mitigations now in `enumerate_wall.py`: `--pace` (0.15 s after every probe),
+`--silence-rests` / `--rest-seconds` (pause and re-ask before accepting
+silence), and retries that stop as soon as the device answers *anything* so a
+real boundary costs one probe rather than three. Where silence still wins, the
+count is reported as an explicit **LOWER BOUND** rather than as fact.
+
+This also means any *monitoring* poll loop has to stay well clear of that
+budget: sustained per-card binary polling is not viable, which is the case for
+SNMP (a full device picture in 0.8 s) as the primary transport.
+
+### Voltage formula — settled by the vendor document
+
+**Correct: `(raw & 0x7F) * 0.1`.** Not `raw * 0.03`.
+
+NovaStar's *H Series Video Wall Splicers Control Protocol* states the encoding
+outright, in §4.3.4 and §5.4.2, with identical wording in V1.0.18 and V1.0.20:
+
+> The lower 7 bits represent the voltage value, in units of 0.1V. For instance,
+> a value of 172 indicates a voltage of 4.4V.
+
+172 & 0x7F = 44 → 4.4 V. The same section gives the temperature worked example
+that this project already matched: "a value of 104 represents a temperature of
+52°C", i.e. units of 0.5 °C. Same encoding as binary register `0x0000000A`
+byte[3] (`parse_voltage()` in `novastar_protocol.py`).
+
+**This section previously said the opposite,** and the reasoning it gave is
+worth keeping visible because it was a plausible-looking mistake:
+
+> Evidence from the 1374-card snapshot: raw values span 165–173.
+> `(raw & 0x7F) / 10` → 3.7–4.5 V, every card below the app's own 4.7 V alarm.
+> `raw * 0.03` → 4.95–5.19 V, a healthy 5 V rail.
+
+Two things are wrong with that. First, the arithmetic conclusion — 165 & 0x7F =
+37 → **3.7 V** and 173 & 0x7F = 45 → **4.5 V** — is correct, and it is exactly
+what `src/wall_live_snapshot.json.cosmic-meadow-backup` actually stores: 1374
+cards spanning 3.7–4.5 V, with 1253 of them at 4.2 or 4.3 V. The 4.95–5.19 V
+figure was never observed; it was produced by the formula, not measured.
+
+Second, "a healthy 5 V rail" was an assumption, not a finding. **These receiving
+cards run at roughly 4.2 V.** The 4.7 V alarm was above their entire normal
+range, so it was guaranteed to fire once per card per cycle no matter which
+formula was used — the alerts were evidence about the *threshold*, and were
+misread as evidence about the *decode*. The floor is now `DEFAULT_VOLTAGE_MIN =
+3.8` in `app.py` (`LEGACY_VOLTAGE_MIN = 4.7` survives only to migrate old
+settings files off it).
+
+Two independent confirmations beyond the vendor text:
+
+- **Cross-schema agreement.** The centi-schema firmware reports `volt` 410–440
+  → 4.10–4.40 V. On the same chain, byte-schema cards decode to 4.2 V masked
+  and 5.10 V unmasked. Only the masked form agrees.
+- **Bit 7 is never clear in the data**, which is what made the unmasked form
+  look self-consistent: every raw value simply came out 12.8 V too high, and
+  uniformly enough to pass for a rail.
+
+Decoded by `h_series_json.decode_voltage_byte()` via `parse_receiving_card()`;
+`device_manager` no longer duplicates it. Pinned by the vendor worked examples
+in `tests/test_protocol.py::TestVendorWorkedExamples` and
+`tests/test_h_series_json.py::TestByteDecoders`.
 
 ### Bit-error register `0x4A010002` — implemented
 

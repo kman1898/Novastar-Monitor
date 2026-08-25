@@ -14,11 +14,16 @@ This is the preferred path for H-series devices. The binary protocol stays in
 device_manager as a fallback if the JSON port doesn't respond (older firmware,
 network filtering, etc.).
 
-Performance notes (the polling workload is ~1374 per-card R0155 reads/cycle):
+This client is strictly READ-ONLY: every command it can send is an `R....`
+query. It used to also send the `W0120` keepalive; that was removed after the
+outage described below and must not come back — see the note at the end of the
+command section.
+
+Performance notes (a full per-card R0155 sweep is ~1374 reads, which is why
+device_manager no longer runs one on a timer):
 
 - One persistent UDP socket is reused for all calls instead of a new socket
-  per request (see `_bulk_socket`). The heartbeat has its own socket and lock
-  so `W0120` never queues behind a batch of card reads.
+  per request.
 - Multiple commands go out in a single datagram (`send_recv_batch`) — the wire
   format is already a JSON array, so this is native to the protocol.
 - Timeouts are per call class: bulk per-card reads use `BULK_TIMEOUT`,
@@ -40,7 +45,7 @@ JSON_UDP_PORT = 6000
 # timeout. 0.3 s is ~2 orders of magnitude above the observed RTT (plenty of
 # headroom for a loaded controller) while capping the cost of a dead card at
 # 0.3 s instead of 2 s.
-BULK_TIMEOUT = 0.3           # R0155 per-card reads, W0120 heartbeat
+BULK_TIMEOUT = 0.3           # R0155 per-card reads
 # Topology/verbose calls (R0100, R0400, R0401, R0405) build large JSON
 # documents (R0401 is ~17 KB, fragmented across several IP datagrams) and the
 # controller can take a while to assemble them. Keep the historical 2 s.
@@ -71,9 +76,8 @@ BATCH_SETTLE = 0.05
 class HSeriesJSONClient:
     """Thread-safe UDP client for the H-series JSON protocol.
 
-    Holds one persistent socket for command/response traffic and a second one
-    for the heartbeat, each behind its own lock. A socket that errors out is
-    closed and lazily recreated on the next call.
+    Holds one persistent socket for command/response traffic, behind one lock.
+    A socket that errors out is closed and lazily recreated on the next call.
 
     The protocol is stateless request/response, so "persistent" here only
     means the file descriptor is reused — there is no connection to keep.
@@ -84,13 +88,11 @@ class HSeriesJSONClient:
         self.ip = ip
         self.port = port
         self.timeout = timeout              # topology / default call class
-        self.bulk_timeout = bulk_timeout    # per-card reads, heartbeat
+        self.bulk_timeout = bulk_timeout    # per-card reads
         self.batch_size = batch_size
 
         self._lock = threading.Lock()       # guards _sock
         self._sock = None
-        self._hb_lock = threading.Lock()    # guards _hb_sock (heartbeat only)
-        self._hb_sock = None
 
         # Flipped to True if the device answers a multi-command datagram but
         # its replies can't be correlated (see send_recv_batch). From then on
@@ -130,13 +132,9 @@ class HSeriesJSONClient:
             self._sock = None
 
     def close(self):
-        """Release both sockets. Safe to call more than once."""
+        """Release the socket. Safe to call more than once."""
         with self._lock:
             self._drop_socket()
-        with self._hb_lock:
-            if self._hb_sock is not None:
-                self._close(self._hb_sock)
-                self._hb_sock = None
 
     @staticmethod
     def _drain(sock):
@@ -444,35 +442,25 @@ class HSeriesJSONClient:
         """R0226 — get_input_list_simplify. Lightweight input enumeration."""
         return self.send_recv({"cmd": "R0226", "param0": 0})
 
-    def heartbeat(self):
-        """W0120 — device_heartbeat. Splicer module sends this every 3s.
-
-        Ack-style keepalive: tells the device a controller is still connected.
-
-        This is NOT fire-and-forget — it sends the command and then blocks on
-        recvfrom for up to `bulk_timeout` (0.3 s) waiting for the ack,
-        returning the parsed response or None if the device stayed silent.
-        It runs on its own socket behind its own lock, so a heartbeat never
-        queues behind a batch of per-card reads (and vice versa); the caller's
-        3 s cadence is therefore never distorted by polling traffic.
-        """
-        cmd_obj = {"cmd": "W0120", "param0": 0}
-        payload_wait = self.bulk_timeout
-        try:
-            with self._hb_lock:
-                if self._hb_sock is None:
-                    self._hb_sock = self._new_socket()
-                sock = self._hb_sock
-                try:
-                    matched, ordered = self._exchange(
-                        sock, [cmd_obj], payload_wait, _echo_key("W0120"), 1)
-                except (OSError, socket.error):
-                    self._close(sock)
-                    self._hb_sock = None
-                    return None
-        except Exception:
-            return None
-        return _pick_single(matched, ordered, "W0120")
+    # ── REMOVED: the W0120 heartbeat. Do not reintroduce it. ───────────────
+    #
+    # There used to be a `heartbeat()` here sending `W0120` every 3 s on its
+    # own socket, copied from the vendor's Bitfocus Companion *control* module
+    # for the splicer. While this monitor was running, the operator lost
+    # control of the wall from Companion — their actual show-control surface —
+    # and killing this app restored it.
+    #
+    # W0120 is a write-class command whose plausible meaning in the control
+    # module's context is "a controller is attached and it is me". A read-only
+    # monitor has no business claiming that role, and nothing here ever needed
+    # the ack: every reading this client produces comes from an `R....` query
+    # that works with no keepalive at all. So the cost was a production outage
+    # and the benefit was zero.
+    #
+    # Removed rather than disabled behind a flag, because a flag is something
+    # somebody eventually turns on. If a future feature genuinely needs to
+    # control the device, that is a separate, clearly-named control client —
+    # not a keepalive smuggled into the monitoring path.
 
 
 # ── Correlation keys ───────────────────────────────────────────────────────
@@ -554,6 +542,14 @@ def _r0155_response_key(resp):
 # ── Helpers for mapping JSON responses to monitor state ────────────────────
 
 
+# An H-series output card has two OPT (fibre) ports and sixteen Ethernet
+# ports. R0100 reports them in two separate blocks — `lightstatus` (2 entries)
+# and `linkstatus` (16) — which is what makes "is this card on fibre or
+# copper?" answerable. See `parse_output_links`.
+OPT_PORTS_PER_CARD = 2
+ETHERNET_PORTS_PER_CARD = 16
+
+
 def parse_device_details(r0100):
     """Extract a minimal monitor-state-friendly dict from R0100."""
     if not isinstance(r0100, dict):
@@ -579,26 +575,180 @@ def parse_device_details(r0100):
                 "is_used": i.get("isUsed"),
                 "over_load_state": i.get("overLoadState"),
             } for i in s.get("interfaces", [])],
+            "output_links": parse_output_links(s),
         } for s in slots],
     }
+
+
+def parse_output_links(slot):
+    """Which of a sender card's outputs are OPT and which are Ethernet.
+
+    R0100 carries two link structures per output card and they cover different
+    hardware:
+
+      `lightstatus`  {link0, link1}          the two OPT (fibre) ports
+      `linkstatus`   {link0 .. link15}       the sixteen Ethernet ports
+
+    Confirmed against a wall whose wiring was known independently: the card
+    running fibre reported `lightstatus {2, 2}` with `linkstatus` all zero,
+    and the card running copper straight out of the Ethernet ports reported
+    `lightstatus {0, 0}` with `linkstatus link0/link1` non-zero and the rest
+    zero. Each card's backup mirrored it. Nothing was told to the device to
+    produce that — both structures agreed with the physical wiring on all four
+    cards.
+
+    So a non-zero entry means "this output is carrying something", and which
+    structure it came from says whether that output is fibre or copper. That
+    is the difference between "OPT 1 port 3" and "Ethernet port 3", which the
+    wall map otherwise has to guess at.
+
+    The *meaning of the value* is not decoded. Observed 1 and 2 on Ethernet
+    and 2 on OPT, with no reading that distinguishes them reliably, so this
+    reports `state` verbatim and claims only up/down. Do not invent a speed or
+    a health grade from it.
+
+    `senderInterfaceStatus` carries the same 16 Ethernet entries in list form;
+    it is read as a fallback for firmware that omits `linkstatus`.
+    """
+    def _entries(block, count):
+        out = []
+        if isinstance(block, dict):
+            for idx in range(count):
+                out.append(block.get(f"link{idx}"))
+        return out
+
+    optical = _entries(slot.get("lightstatus"), OPT_PORTS_PER_CARD)
+    ethernet = _entries(slot.get("linkstatus"), ETHERNET_PORTS_PER_CARD)
+
+    if not any(v is not None for v in ethernet):
+        by_id = {}
+        for entry in (slot.get("senderInterfaceStatus") or []):
+            if isinstance(entry, dict) and entry.get("id") is not None:
+                by_id[entry["id"]] = entry.get("status")
+        if by_id:
+            ethernet = [by_id.get(i) for i in range(ETHERNET_PORTS_PER_CARD)]
+
+    def _ports(states, medium):
+        return [{"index": i, "medium": medium, "state": st,
+                 "up": bool(st)}
+                for i, st in enumerate(states) if st is not None]
+
+    opt_ports = _ports(optical, "opt")
+    eth_ports = _ports(ethernet, "ethernet")
+    opt_up = [p for p in opt_ports if p["up"]]
+    eth_up = [p for p in eth_ports if p["up"]]
+
+    # What the card is actually wired with. Both non-empty is legal hardware,
+    # so it gets its own answer rather than being forced into one or the other.
+    if opt_up and eth_up:
+        medium = "mixed"
+    elif opt_up:
+        medium = "opt"
+    elif eth_up:
+        medium = "ethernet"
+    else:
+        medium = None
+
+    return {
+        "medium": medium,
+        "opt": opt_ports,
+        "ethernet": eth_ports,
+        "opt_up": [p["index"] for p in opt_up],
+        "ethernet_up": [p["index"] for p in eth_up],
+    }
+
+
+# ── R0155 reply schemas ────────────────────────────────────────────────────
+#
+# Two different R0155 reply shapes have been seen on real hardware, and both
+# are supported because both came off actual devices in this fleet.
+#
+# SCHEMA_BYTE — the original capture::
+#
+#     {"deviceId":0,"slotId":20,"portId":0,"recvCardId":0,
+#      "power0Status":0,"power1Status":0,"brightness":127,
+#      "temp":88,"voltage":170,"cmd":"R0155","ack":"Ok"}
+#
+# SCHEMA_CENTI — captured live off the operator's H-series, 2026-08-08::
+#
+#     {"deviceId":0,"slotId":20,"portId":0,"recvCardId":10,
+#      "mcuVersion":"V4.5.1.81","fpgaVersion":"V4.5.1.81",
+#      "workStatus":0,"tempStatus":0,"temp":3700,"tempMax":70,
+#      "voltStatus":0,"volt":440,"power0Status":0,"power1Status":0,
+#      "brightness":25,"cmd":"R0155","ack":"Ok"}
+#
+# The two disagree about BOTH the key names and the scaling of `temp`, so
+# decoding one as the other is not a rounding error — 3700 read as a raw byte
+# is 1850 °C, which is exactly the bogus reading this split was added to fix.
+#
+# Detection is by KEY PRESENCE, never by value range. The voltage key is the
+# discriminator (`volt` vs `voltage`) because it is the one field that is
+# named differently in the two captures and is present in both of them; a
+# range test on `temp` would have no defensible cut-off (a byte-schema card at
+# 44 °C reports 88, and nothing rules out a centi-schema card reporting 88 =
+# 0.88 °C on a cold start). The extra centi-only keys act as a backstop for a
+# reply that carries the status block but no voltage field.
+#
+# EVERY scaling below is firmware-dependent and inferred from these two
+# captures alone. Neither is in the published PDF, which documents the R0155
+# *request* but not the reply body. A third firmware could plausibly use a
+# third encoding; if one shows up it needs its own schema, not a tweak to
+# these.
+SCHEMA_BYTE = "byte"      # temp / 2 → °C, (voltage & 0x7F) * 0.1 → V
+SCHEMA_CENTI = "centi"    # temp / 100 → °C, volt / 100 → V
+
+# Keys that only the centi-schema firmware has been observed to send. Used
+# only as a fallback when neither voltage key is present.
+_CENTI_ONLY_KEYS = ("workStatus", "tempStatus", "voltStatus", "tempMax")
+
+
+def detect_receiving_card_schema(r0155):
+    """Return SCHEMA_CENTI or SCHEMA_BYTE for an R0155 reply.
+
+    `volt` is checked before `voltage`: no reply carrying `volt` has ever been
+    seen from the byte-schema firmware, so if both somehow appear the newer
+    shape wins. A reply with neither voltage key falls back to SCHEMA_BYTE,
+    which is a compatibility default and not a claim about the wire format —
+    every capture of either schema has included its own voltage key, so this
+    only affects replies we have never seen.
+    """
+    if not isinstance(r0155, dict):
+        return SCHEMA_BYTE
+    if "volt" in r0155:
+        return SCHEMA_CENTI
+    if "voltage" in r0155:
+        return SCHEMA_BYTE
+    if any(k in r0155 for k in _CENTI_ONLY_KEYS):
+        return SCHEMA_CENTI
+    return SCHEMA_BYTE
 
 
 def parse_receiving_card(r0155):
     """Extract per-card state from an R0155 response.
 
-    Field names are taken from a live capture off the H-series at
-    192.168.0.10, not from the PDF (which documents the request but not the
-    reply body)::
+    Handles both reply schemas — see SCHEMA_BYTE / SCHEMA_CENTI above for the
+    captures and the scaling each one implies.
 
-        {"deviceId":0,"slotId":20,"portId":0,"recvCardId":0,
-         "power0Status":0,"power1Status":0,"brightness":127,
-         "temp":88,"voltage":170,"cmd":"R0155","ack":"Ok"}
+    A card the controller can't reach produces no reply at all, so `None` in /
+    `None` out is one offline signal. There are two more:
 
-    `temp` and `voltage` are raw bytes — see decode_temp_byte() and
-    decode_voltage_byte(). Power status bytes are 0 = OK, non-zero = fault
-    (power0 = primary supply, power1 = backup supply). A card the controller
-    can't reach produces no reply at all, so `None` in / `None` out is the
-    offline signal; a reply with a non-"Ok" ack is treated as offline too.
+    · a non-"Ok" ack, and
+    · `workStatus != 0` (centi schema only).
+
+    `workStatus` is the important one. On the live wall every card with
+    `workStatus == 1` reported `temp: 0`, `volt: 0`, `brightness: 0` and
+    `voltStatus: 2`, while every `workStatus == 0` card reported plausible
+    readings (temp 3600–3800, volt 410–430). Those zeros are PLACEHOLDERS for
+    a card that is not reporting, not measurements of a card sitting at 0 °C
+    on a dead 0 V rail. So a non-reporting card comes back with `online:
+    False` and every reading — temperature, voltage, brightness AND both power
+    flags — set to None rather than to the placeholder value. Nothing
+    downstream may average, max, or alert on a number the device never
+    measured, and `power0Status: 0` on such a card must not read as "primary
+    supply healthy" (the same trap, inverted).
+
+    Only `workStatus == 0` (reporting) and `1` (absent/unreachable) have been
+    observed; anything non-zero is treated as not reporting.
 
     Returns keys in the shape device_manager already stores per card
     (temp_c / temperature_c / voltage_v / brightness / primary_power_ok /
@@ -607,34 +757,135 @@ def parse_receiving_card(r0155):
     if not isinstance(r0155, dict):
         return None
     ack = r0155.get("ack")
-    temp_raw = _maybe_int(r0155.get("temp"))
-    volt_raw = _maybe_int(r0155.get("voltage"))
-    temp_c = decode_temp_byte(temp_raw)
-    return {
-        "online": ack is None or str(ack).lower() == "ok",
+    ack_ok = ack is None or str(ack).lower() == "ok"
+    schema = detect_receiving_card_schema(r0155)
+
+    # Absent on the byte schema, which has no work-status field at all. An
+    # answering byte-schema card is therefore assumed to be reporting — that
+    # is the behaviour it has always had, and there is no field to say
+    # otherwise.
+    work_status = _maybe_int(r0155.get("workStatus"))
+    reporting = work_status is None or work_status == 0
+
+    card = {
+        "online": ack_ok and reporting,
+        "reporting": reporting,
+        "work_status": work_status,
         "ack": ack,
+        "schema": schema,
         "slot": r0155.get("slotId"),
         "port": r0155.get("portId"),
         "card_id": r0155.get("recvCardId"),
         # Both temperature keys: the aggregator reads temperature_c, the
-        # device-tree renderer reads temp_c.
-        "temp_c": temp_c,
-        "temperature_c": temp_c,
-        "temperature_raw": temp_raw,
-        "voltage_v": decode_voltage_byte(volt_raw),
-        "voltage_raw": volt_raw,
-        "brightness": r0155.get("brightness"),
-        "primary_power_ok": _status_ok(r0155.get("power0Status")),
-        "backup_power_ok": _status_ok(r0155.get("power1Status")),
+        # device-tree renderer reads temp_c. Present-but-None means "no
+        # reading", which is what every consumer's `is not None` guard wants.
+        "temp_c": None,
+        "temperature_c": None,
+        "temperature_raw": None,
+        "voltage_v": None,
+        "voltage_raw": None,
+        "brightness": None,
+        "primary_power_ok": None,
+        "backup_power_ok": None,
+        # The controller's own temperature limit for this card (centi schema
+        # only; 70 on every card of the live wall). Read as whole °C, not
+        # centi-°C: the centi scaling would make it 0.7 °C, which is not a
+        # limit. More authoritative than the app's hardcoded default
+        # threshold, though nothing alerts on it yet.
+        "temp_limit_c": _maybe_int(r0155.get("tempMax")),
+        # The device's own verdict on each reading, centi schema only.
+        # 0 = OK; 2 is the only other value observed, and only on cards that
+        # were also `workStatus: 1`. The full enum is UNCAPTURED, so any
+        # non-zero is treated as "the device says this reading isn't good"
+        # without claiming to know why. Surfaced, not acted on: a non-zero
+        # status on a card that IS reporting has never been observed, and
+        # suppressing its reading could hide a genuine over-temperature.
+        "temp_status": _maybe_int(r0155.get("tempStatus")),
+        "volt_status": _maybe_int(r0155.get("voltStatus")),
+        "temp_status_ok": _status_ok(r0155.get("tempStatus")),
+        "volt_status_ok": _status_ok(r0155.get("voltStatus")),
+        # Per-card firmware (centi schema only) — a card whose versions differ
+        # from the rest of its chain is worth spotting.
+        "mcu_version": r0155.get("mcuVersion"),
+        "fpga_version": r0155.get("fpgaVersion"),
         "raw": r0155,
     }
 
+    if not card["online"]:
+        # Not reporting (or a failed ack): every value in the reply is a
+        # placeholder. Leave them all None.
+        return card
+
+    temp_raw = _maybe_int(r0155.get("temp"))
+    if schema == SCHEMA_CENTI:
+        volt_raw = _maybe_int(r0155.get("volt"))
+        temp_c = decode_temp_centi(temp_raw)
+        volt_v = decode_volt_centi(volt_raw)
+    else:
+        volt_raw = _maybe_int(r0155.get("voltage"))
+        temp_c = decode_temp_byte(temp_raw)
+        volt_v = decode_voltage_byte(volt_raw)
+
+    card.update({
+        "temp_c": temp_c,
+        "temperature_c": temp_c,
+        "temperature_raw": temp_raw,
+        "voltage_v": volt_v,
+        "voltage_raw": volt_raw,
+        "brightness": r0155.get("brightness"),
+        # Power status: 0 = OK, non-zero = fault (power0 = primary supply,
+        # power1 = backup). The polarity is INFERRED, not documented — it is
+        # consistent with the live wall (present cards were mostly 0,0) but
+        # one card that was plainly working reported 1,1, so a non-zero value
+        # is not proof of a failed supply. Only ever evaluated for a card that
+        # is actually reporting, so a non-reporting card's placeholder 0,0
+        # can never be read as "both supplies healthy".
+        "primary_power_ok": _power_status(r0155.get("power0Status"), True),
+        "backup_power_ok": _power_status(r0155.get("power1Status"), True),
+        # The raw fields, kept so the meaning can be settled later without
+        # re-reading the wall.
+        "power0_status_raw": r0155.get("power0Status"),
+        "power1_status_raw": r0155.get("power1Status"),
+    })
+    return card
+
+
+def decode_temp_centi(v):
+    """Centi-schema temp → °C: value / 100.
+
+    From the live H-series capture: `temp` 3600–3800 across reporting cards →
+    36.0–38.0 °C, which matches a wall running normally. The same values under
+    the byte schema's `/2` would be 1800–1900 °C.
+    """
+    if v is None:
+        return None
+    try:
+        return round(int(v) / 100.0, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def decode_volt_centi(v):
+    """Centi-schema volt → V: value / 100.
+
+    From the same capture: `volt` 410–440 on reporting cards → 4.10–4.40 V.
+    Cards that were not reporting (`workStatus: 1`) all read 0, which is a
+    placeholder and never reaches this function.
+    """
+    if v is None:
+        return None
+    try:
+        return round(int(v) / 100.0, 2)
+    except (TypeError, ValueError):
+        return None
+
 
 def decode_temp_byte(b):
-    """Raw temp byte → °C. Per H-series PDF §5.4.2: byte / 2.
+    """Byte-schema temp → °C. Per H-series PDF §5.4.2: byte / 2.
 
-    Captured wall reads 80–110 raw across 1374 cards → 40–55 °C, matching
-    the NovaLCT MonitorSite GUI.
+    Byte schema ONLY (a reply carrying `voltage`, not `volt`). The captured
+    wall reads 80–110 raw across 1374 cards → 40–55 °C, matching the NovaLCT
+    MonitorSite GUI. The centi-schema firmware uses decode_temp_centi().
     """
     if b is None:
         return None
@@ -645,26 +896,25 @@ def decode_temp_byte(b):
 
 
 def decode_voltage_byte(b):
-    """Raw voltage byte → volts, using the vendor formula `raw * 0.03`.
+    """Byte-schema voltage → volts: lower 7 bits, units of 0.1 V.
 
-    Same encoding as the binary live-monitoring register 0x0000000A byte[3]
-    (`parse_voltage()` in novastar_protocol.py, calibrated against VX1000 and
-    documented in docs/VX1000_Protocol_Analysis.md).
+    NovaStar's H Series Video Wall Splicers Control Protocol says it outright
+    in §4.3.4 and §5.4.2, identically in V1.0.18 and V1.0.20: "The lower 7 bits
+    represent the voltage value, in units of 0.1V. For instance, a value of 172
+    indicates a voltage of 4.4V."
 
-    NOT `(raw & 0x7F) / 10`. That variant was a guess and it is wrong: the
-    1374-card capture spans raw 165–173, which is 4.95–5.19 V under the vendor
-    formula (a healthy 5 V rail) but 3.7–4.5 V under the masked one — below
-    the app's own 4.7 V low-voltage alarm threshold for every card on a wall
-    that was running normally. The high bit is never clear in the captured
-    data, so masking it off just silently subtracts 12.8 V-units.
+    This used to be `raw * 0.03`, changed in this project on the reasoning that
+    the masked form put every card under a 4.7 V alarm on a healthy wall. That
+    reasoning was backwards — the threshold was wrong, not the formula.
+    Receiving cards run around 4.2 V. The unmasked form also disagreed with the
+    centi schema by roughly 0.9 V on the same hardware; the masked form agrees
+    with it.
+
+    Byte schema ONLY — the centi firmware uses decode_volt_centi().
     """
-    if b is None:
+    if not isinstance(b, int):
         return None
-    try:
-        return round(int(b) * 0.03, 2)
-    except (TypeError, ValueError):
-        return None
-
+    return round((b & 0x7F) * 0.1, 2)
 
 def _maybe_int(v):
     if v is None:
@@ -676,7 +926,53 @@ def _maybe_int(v):
 
 
 def _status_ok(v):
-    """Power status byte: 0 = OK, non-zero = fault, missing = unknown."""
+    """Status field → True (0 = OK) / False (non-zero) / None (missing).
+
+    Shared by tempStatus / voltStatus. `0 = OK` is inferred from the captures,
+    not from the PDF, and the non-zero values are only partly observed
+    (temp/volt status: 2).
+
+    Coerced through `_maybe_int` first, exactly as its twin
+    `snmp_client._status_ok` does. The captured firmware sends these as JSON
+    numbers, but every other numeric field in this module is coerced for a
+    reason: this device family has been observed quoting numbers in JSON, and
+    an uncoerced `"0" == 0` is False. That is a healthy card reported as a
+    temperature or voltage FAULT — the string is the only thing wrong with it —
+    and the fix for a false fault mid-show is somebody walking to the wall.
+
+    A value that is not a number at all is unknown rather than a fault:
+    `_maybe_int` gives None and so does this. Note the deliberate asymmetry
+    with `_power_status` below, which never returns False at all; that is a
+    different question (what non-zero MEANS) and is settled differently.
+    """
+    v = _maybe_int(v)
     if v is None:
         return None
     return v == 0
+
+
+def _power_status(v, reporting):
+    """`powerNStatus` → True (healthy) / None (unknown). Never False.
+
+    `0 = healthy, non-zero = failed` was inferred from captures, and the live
+    wall disproved the second half of it. Fifteen cards reported
+    `power0Status: 1` AND `power1Status: 1` while simultaneously reporting
+    41-42 °C and 4.0-4.1 V. A card cannot measure and transmit its own
+    temperature through a failed primary supply — it is powered and talking.
+    Read as "both supplies failed" it produced a warning every polling cycle
+    on a wall that was lit and healthy.
+
+    So non-zero on a REPORTING card is not a supply failure. What it actually
+    means is not known: most likely a PSU that is not fitted or not monitored
+    on that panel model, since panels with a single supply still have two
+    status fields. Until NovaStar confirms it (see
+    docs/NOVASTAR_PROTOCOL_QUESTIONS.md), the honest answer is None — unknown
+    — and nothing alerts on it.
+
+    `0` is still taken as healthy, but only from a reporting card: on a
+    non-reporting one every field is a placeholder, and a placeholder zero
+    read as "supply healthy" is the same trap inverted.
+    """
+    if v is None or not reporting:
+        return None
+    return True if v == 0 else None

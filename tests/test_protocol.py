@@ -1,4 +1,5 @@
 """Tests for novastar_protocol.py — frame building and data parsing."""
+import pytest
 import struct
 import novastar_protocol as proto
 
@@ -109,11 +110,24 @@ class TestBuildReadCard:
         frame = proto.build_read_card(1, 0x0000000A, 0x5200, 3, 7)
         assert frame[5] == 0x00
 
-    def test_opt_group_byte5_is_the_port_kwarg(self):
-        """The `port` kwarg still writes byte 5 — it is NOT the chain."""
-        frame = proto.build_read_card(1, 0x0000000A, 0x5200, 3, 7, port=0x02)
+    def test_sender_card_is_byte5(self):
+        """Byte 5 selects the sender card — it is NOT the chain.
+
+        Verified on a two-sender H15: the same (chain 0, card 0) address
+        answers `05 0000` at sender_card=0 and `05 0300` at sender_card=1.
+        """
+        frame = proto.build_read_card(1, 0x0000000A, 0x5200, 3, 7,
+                                      sender_card=0x02)
         assert frame[5] == 0x02
-        assert frame[7] == 3  # chain unaffected by the OPT group
+        assert frame[7] == 3  # chain unaffected by the sender card
+
+    def test_sender_card_only_changes_byte5(self):
+        """Switching sender cards must not disturb any other address byte."""
+        a = proto.build_read_card(1, 0x0000000A, 0x5200, 3, 7, sender_card=0)
+        b = proto.build_read_card(1, 0x0000000A, 0x5200, 3, 7, sender_card=1)
+        assert a[5] == 0 and b[5] == 1
+        assert a[:5] == b[:5]
+        assert a[6:18] == b[6:18]
 
     def test_per_card_marker_byte6(self):
         """Byte 6 must be 0x01 (direct-to-receiving-card command)."""
@@ -197,9 +211,18 @@ class TestBuildReadCard:
 
 class TestParseResponse:
     def _make_response(self, reg, payload, seq=1):
-        """Build a minimal valid response frame using the documented checksum."""
+        """Build a valid response frame: real length field, real checksum.
+
+        The length field goes through `encode_length`, the same way the device
+        (and every frame builder in the module) writes it. Stuffing the raw
+        byte count in there produces a frame no device would ever send —
+        `len(payload) == 26` wire-encodes as 0x001A, which decodes back to
+        6656 bytes — and a hand-built frame that does not agree with itself
+        cannot be used to test a parser whose job is checking exactly that.
+        """
         header = struct.pack(">H", proto.HEADER_RESPONSE)
-        body = struct.pack(">HBB6xIH", seq, 0x00, 0xFE, reg, len(payload)) + payload
+        body = struct.pack(">HBB6xIH", seq, 0x00, 0xFE, reg,
+                           proto.encode_length(len(payload))) + payload
         return header + body + struct.pack("<H", proto.checksum(body))
 
     def test_valid_response(self):
@@ -221,6 +244,111 @@ class TestParseResponse:
         assert result is not None
         assert result[1] == b""
 
+    def test_payload_is_exactly_what_the_length_field_declared(self):
+        """The returned payload's length must be the frame's own answer to
+        'how much data is this', not 'whatever was left in the buffer'."""
+        payload = bytes(range(82))
+        result = proto.parse_response(self._make_response(0x0000000A, payload))
+        assert result[1] == payload
+        assert len(result[1]) == proto.decode_length(0x5200)
+
+
+class TestParseResponseFraming:
+    """A frame that isn't exactly one whole frame must parse as nothing.
+
+    Every consumer of the payload indexes it positionally — byte[31] for the
+    H-series port bitmask, byte[0]/byte[1] for per-card presence and
+    temperature. Handing those callers a payload assembled from the wrong
+    bytes does not raise; it produces a reading that looks like a measurement.
+    On this dashboard that is either a false all-clear over a dark panel or a
+    false fault that sends somebody to the wall mid-show.
+    """
+
+    def _frame(self, reg, payload, seq=1):
+        header = struct.pack(">H", proto.HEADER_RESPONSE)
+        body = struct.pack(">HBB6xIH", seq, 0x00, 0xFE, reg,
+                           proto.encode_length(len(payload))) + payload
+        return header + body + struct.pack("<H", proto.checksum(body))
+
+    def test_rejects_a_short_read_of_a_large_register(self):
+        """`read_register` does a single `sock.recv`; TCP may hand back half a
+        frame. A 512-byte video-status reply truncated to 40 bytes used to
+        yield a payload whose byte[31] was then read as the port bitmask —
+        eight ports declared connected or disconnected from bytes the device
+        never sent for that field."""
+        full = self._frame(0x00000002, bytes(512))
+        assert proto.parse_response(full) is not None
+        truncated = full[:58]  # 18 framing + 40 payload bytes
+        assert len(truncated) > 20            # long enough to fool the old guard
+        assert proto.parse_response(truncated) is None
+
+    def test_rejects_a_frame_missing_only_its_last_byte(self):
+        """One byte short is the hardest case to spot and the easiest to hit:
+        the payload still decodes, just one byte shifted at the tail."""
+        full = self._frame(0x0000000A, bytes(82))
+        assert proto.parse_response(full[:-1]) is None
+
+    def test_rejects_two_coalesced_frames(self):
+        """The controller answers back-to-back reads in one TCP segment under
+        load. `data[18:-2]` then returned the first payload with the SECOND
+        frame's header and body-head glued onto the end of it, so one
+        register's readings ran on into another register's framing."""
+        first = self._frame(0x0000000A, bytes(82), seq=1)
+        second = self._frame(0x09050002, b"\x00", seq=2)
+        assert proto.parse_response(first + second) is None
+
+    def test_rejects_trailing_garbage_after_a_valid_frame(self):
+        """Anything past the declared payload means the stream is not where we
+        think it is. Parsing the good prefix and dropping the rest would leave
+        the next read misaligned instead."""
+        full = self._frame(0x0000000A, bytes(82))
+        assert proto.parse_response(full + b"\xAA") is None
+
+    def test_rejects_a_length_field_that_overstates_the_payload(self):
+        """A corrupted length field claiming more data than arrived must not
+        produce a short payload that callers then index into."""
+        header = struct.pack(">H", proto.HEADER_RESPONSE)
+        body = struct.pack(">HBB6xIH", 1, 0x00, 0xFE, 0x0000000A,
+                           proto.encode_length(82)) + bytes(40)
+        frame = header + body + struct.pack("<H", proto.checksum(body))
+        assert proto.parse_response(frame) is None
+
+    def test_rejects_a_corrupted_payload_byte(self):
+        """The checksum is the only end-to-end evidence that these are the
+        bytes the device sent. A flipped byte in a temperature payload is a
+        wrong temperature, not an error, unless it is checked."""
+        full = bytearray(self._frame(0x0000000A, bytes(82)))
+        full[18 + 1] ^= 0xFF     # byte[1] of the payload: the temperature byte
+        assert proto.parse_response(bytes(full)) is None
+
+    def test_rejects_a_corrupted_register_address(self):
+        """Callers compare the register to decide whether a reply is theirs.
+        A register that flipped in transit would send an answer to the wrong
+        caller, so it must fail the checksum rather than be believed."""
+        full = bytearray(self._frame(0x0000000A, bytes(82)))
+        full[12] ^= 0x01
+        assert proto.parse_response(bytes(full)) is None
+
+    def test_rejects_a_swapped_checksum(self):
+        """The checksum is little-endian on the wire (§3.2.1). A big-endian
+        one is what a re-implementation gets wrong, and it must not pass."""
+        full = self._frame(0x0000000A, bytes(82))
+        swapped = full[:-2] + bytes([full[-1], full[-2]])
+        if full[-1] != full[-2]:
+            assert proto.parse_response(swapped) is None
+
+    def test_accepts_the_frame_the_enumerator_stub_builds(self):
+        """The fake sender card in tests/test_enumerate_wall.py mirrors the
+        request's 16 body bytes and pads the payload to the declared length.
+        That is the shape real captures show, and it must still parse."""
+        request = proto.build_read_card(7, 0x4A010002, 0x0300, 3, 5)
+        body = request[2:18] + bytes([0x05, 0x00, 0x00])
+        frame = (struct.pack(">H", proto.HEADER_RESPONSE) + body
+                 + struct.pack("<H", proto.checksum(body)))
+        reg, payload = proto.parse_response(frame)
+        assert reg == 0x4A010002
+        assert payload == b"\x05\x00\x00"
+
 
 # ── Data Parsing ────────────────────────────────────────────
 
@@ -237,9 +365,56 @@ class TestParseTemperature:
 
 class TestParseVoltage:
     def test_known_values(self):
-        """Values confirmed from VX1000 captures."""
-        assert abs(proto.parse_voltage(172) - 5.16) < 0.01
-        assert abs(proto.parse_voltage(174) - 5.22) < 0.01
+        """Raw bytes seen in VX1000 captures, decoded the documented way.
+
+        NovaStar's H Series Video Wall Splicers Control Protocol (§4.3.4 and
+        §5.4.2, identical text in V1.0.18 and V1.0.20) defines the byte as
+        "The lower 7 bits represent the voltage value, in units of 0.1V." So
+        172 & 0x7F = 44 → 4.4 V and 174 & 0x7F = 46 → 4.6 V.
+
+        These used to assert 5.16 / 5.22, i.e. `raw * 0.03`. That formula was
+        invented in this project, not read off a vendor document, and it was
+        adopted because the documented form put every card under a 4.7 V
+        low-voltage alarm on a wall that was demonstrably healthy. The
+        threshold was the thing that was wrong: receiving cards on this
+        hardware run around 4.2 V, not 5 V, and the alarm has since been
+        lowered to 3.8 V. See TestVendorWorkedExamples below.
+        """
+        assert abs(proto.parse_voltage(172) - 4.4) < 0.01
+        assert abs(proto.parse_voltage(174) - 4.6) < 0.01
+
+
+class TestVendorWorkedExamples:
+    """The two numbers NovaStar spelled out, pinned so they cannot drift.
+
+    Both come from the H Series Video Wall Splicers Control Protocol, §4.3.4
+    and §5.4.2, which carry identical text in V1.0.18 and V1.0.20. They are
+    the only receiving-card scalings the vendor states with a worked example,
+    so they are the anchor for every other expected value in this file.
+
+    The voltage formula in particular has already been changed away from the
+    documented one once in this project's history and had to be changed back.
+    These tests exist so the next person doing that has to delete an explicit
+    citation rather than quietly adjust an arithmetic constant.
+    """
+
+    def test_voltage_172_is_4_4_volts(self):
+        """"For instance, a value of 172 indicates a voltage of 4.4V.\""""
+        assert round(proto.parse_voltage(172), 2) == 4.4
+
+    def test_temperature_104_is_52_celsius(self):
+        """"a value of 104 represents a temperature of 52°C.\""""
+        assert proto.parse_temperature(104) == 52.0
+
+    def test_high_bit_is_masked_off(self):
+        """"The lower 7 bits represent the voltage value" — bit 7 is not part
+        of the number. 172 (0xAC) and 44 (0x2C) differ only in that bit, so
+        they must decode identically; if the mask is ever dropped they differ
+        by 12.8 V."""
+        assert round(proto.parse_voltage(172), 2) == \
+            round(proto.parse_voltage(44), 2) == 4.4
+        assert round(proto.parse_voltage(0xAA), 2) == \
+            round(proto.parse_voltage(0x2A), 2) == 4.2
 
 
 class TestParseLiveMonitoring:
@@ -272,8 +447,10 @@ class TestParseLiveMonitoring:
         assert result["temperature_c"] == 58.0
 
     def test_voltage(self):
+        """173 & 0x7F = 45 → 4.5 V (vendor doc §4.3.4 / §5.4.2, units of
+        0.1 V from the lower 7 bits)."""
         result = proto.parse_live_monitoring(self._make_payload(volt=173))
-        assert result["voltage_v"] == 5.19
+        assert result["voltage_v"] == 4.5
 
     def test_card_count(self):
         result = proto.parse_live_monitoring(self._make_payload(card_count=13))
@@ -305,6 +482,18 @@ class TestParseLiveMonitoring:
     def test_rejects_none(self):
         assert proto.parse_live_monitoring(None) is None
 
+    def test_scan_multiplier_is_reported_when_it_is_actually_there(self):
+        result = proto.parse_live_monitoring(self._make_payload(scan=16))
+        assert result["scan_multiplier"] == 16
+
+    def test_a_device_reporting_scan_zero_is_a_reading_not_a_gap(self):
+        """0 has to stay distinguishable from 'we were never told'. It used to
+        be the fallback for a short payload as well, so the two were the same
+        value and no consumer could tell a measurement from a missing one."""
+        result = proto.parse_live_monitoring(self._make_payload(scan=0))
+        assert result["scan_multiplier"] == 0
+        assert result["scan_multiplier"] is not None
+
     def test_all_14_cards_capture_values(self):
         """Verify parsing works for the exact byte values seen in Wireshark captures.
 
@@ -319,6 +508,51 @@ class TestParseLiveMonitoring:
             assert result["online"] is True
             assert result["temperature_c"] == t / 2.0
             assert result["link_status"] == "PRIMARY"
+
+
+class TestLiveMonitoringMissingTailFields:
+    """The tail of the payload (MAC, hardware revision) is absent, not blank.
+
+    A 20-byte payload is long enough to parse but stops before the MAC at
+    byte[18] and the hardware revision at byte[24]. Those fields used to fall
+    back to "", which the dashboard renders as an empty MAC field — a
+    statement about the card, made from a read that never got that far. The
+    UI's own `lm.mac_address || '—'` renders None as an em dash, which is the
+    honest answer.
+    """
+
+    def _short_payload(self, length=20):
+        b = bytearray(length)
+        b[0] = 0x80      # present
+        b[1] = 84        # 42.0 C  (84 / 2)
+        b[3] = 170       # 4.20 V  (170 & 0x7F = 42, units of 0.1 V)
+        b[12] = 1        # PRIMARY
+        b[17] = 8        # scan multiplier
+        return bytes(b)
+
+    def test_absent_mac_is_none_not_empty_string(self):
+        result = proto.parse_live_monitoring(self._short_payload())
+        assert result["mac_address"] is None
+
+    def test_absent_hw_revision_is_none_not_empty_string(self):
+        result = proto.parse_live_monitoring(self._short_payload())
+        assert result["hw_revision"] is None
+
+    def test_the_readings_that_did_arrive_still_decode(self):
+        """Missing tail fields must not cost us the temperature and voltage
+        that were in the part of the payload we did get."""
+        result = proto.parse_live_monitoring(self._short_payload())
+        assert result["present"] is True
+        assert result["temperature_c"] == 42.0
+        assert result["voltage_v"] == 4.2
+        assert result["scan_multiplier"] == 8
+
+    def test_parse_mac_on_a_short_buffer_is_none(self):
+        """Same rule one level down: six bytes we never received are not a
+        blank MAC address."""
+        assert proto.parse_mac(b"\x00" * 20) is None
+        assert proto.parse_mac(b"\x00" * 18 + b"\x32\x54\x76\x98\xBA\x0C") == \
+            "32:54:76:98:BA:0C"
 
 
 class TestParseNSSD:
@@ -482,6 +716,45 @@ class TestHCardLink:
     def test_none(self):
         assert proto.parse_h_card_link(None) is None
 
+    def test_high_bit_is_not_counted_as_an_eighth_path(self):
+        """0xFF used to render as "8/7" — a fraction the wall does not have.
+
+        A healthy card reads 0x7F, so bit 7 is not a data path; counting the
+        whole byte against a fixed total of 7 produced a nonsense ratio on
+        exactly the card an operator is most likely to be looking at, because
+        they are looking at it to find out what is wrong.
+        """
+        data = bytearray(512)
+        data[1] = 0xFF
+        connected, total = proto.parse_h_card_link(bytes(data))
+        assert (connected, total) == (7, 7)
+        assert connected <= total
+
+    def test_the_high_bit_alone_is_no_paths_at_all(self):
+        """0x80 is all seven paths down. Counting bit 7 would have called it
+        one healthy path and kept the card looking partly alive."""
+        data = bytearray(512)
+        data[1] = 0x80
+        assert proto.parse_h_card_link(bytes(data)) == (0, 7)
+
+    def test_connected_never_exceeds_the_total_for_any_byte_value(self):
+        """The ratio is rendered straight into the UI as "n/7"; there is no
+        byte value that may produce a numerator above the denominator."""
+        for value in range(256):
+            data = bytearray(512)
+            data[1] = value
+            connected, total = proto.parse_h_card_link(bytes(data))
+            assert total == proto.H_CARD_LINK_PATHS
+            assert 0 <= connected <= total, hex(value)
+
+    def test_masking_did_not_move_the_captured_readings(self):
+        """The values the capture actually shows must decode as they always
+        did — the mask only removes a bit no healthy card sets."""
+        for raw, expected in ((0x7F, 7), (0x3D, 5), (0x00, 0)):
+            data = bytearray(512)
+            data[1] = raw
+            assert proto.parse_h_card_link(bytes(data)) == (expected, 7)
+
 
 class TestHCardTemperature:
     """parse_h_card_temperature is DEPRECATED — register 0x00400003 isn't temp.
@@ -629,3 +902,140 @@ class TestParseBitErrors:
         for value in (0, 1, 255, 256, 4096, 30000, 65534, 65535):
             payload = b"\x05" + struct.pack("<H", value)
             assert proto.parse_bit_errors(payload)["errors"] == value
+
+
+class TestClearBitErrors:
+    """The only write frame this codebase builds. Golden bytes come from
+    `Bit error 4x clear erros.pcapng`, where the operator clicked clear four
+    times and NovaLCT sent four frames identical but for the sequence."""
+
+    CAPTURED = {
+        169: "55aa00a9feff01ffffff010076000001010005775b",
+        202: "55aa00cafeff01ffffff010076000001010005985b",
+        203: "55aa00cbfeff01ffffff010076000001010005995b",
+        204: "55aa00ccfeff01ffffff0100760000010100059a5b",
+        205: "55aa00cdfeff01ffffff0100760000010100059b5b",
+    }
+
+    def test_matches_every_captured_frame(self):
+        for seq, wire in self.CAPTURED.items():
+            assert proto.build_clear_bit_errors(seq).hex() == wire, seq
+
+    def test_broadcasts_to_all_sender_cards_and_all_cards(self):
+        f = proto.build_clear_bit_errors(1)
+        assert f[5] == 0xFF               # every sender card
+        assert f[7:10] == b"\xff\xff\xff"  # every chain, every card
+        assert f[6] == 0x01                # per-card command
+
+    def test_targets_the_clear_register(self):
+        f = proto.build_clear_bit_errors(1)
+        assert struct.unpack(">I", f[12:16])[0] == 0x76000001
+
+    def test_carries_the_single_payload_byte(self):
+        f = proto.build_clear_bit_errors(1)
+        assert proto.decode_length(struct.unpack(">H", f[16:18])[0]) == 1
+        assert f[18:19] == b"\x05"
+
+    def test_checksum_is_valid(self):
+        f = proto.build_clear_bit_errors(4242)
+        assert struct.unpack("<H", f[-2:])[0] == proto.checksum(f[2:-2])
+
+    def test_it_is_the_only_write_builder(self):
+        """A general-purpose write primitive would make every register in the
+        device reachable from a typo. There must be exactly one."""
+        builders = [n for n in dir(proto)
+                    if n.startswith("build_") and callable(getattr(proto, n))]
+        writes = [n for n in builders if "read" not in n]
+        assert writes == ["build_clear_bit_errors"], writes
+
+
+class TestEncodeLength:
+
+    def test_round_trips_byte_mode(self):
+        for n in (1, 2, 3, 82, 255):
+            assert proto.decode_length(proto.encode_length(n)) == n
+
+    def test_one_byte_matches_the_captured_frame(self):
+        assert proto.encode_length(1) == 0x0100
+
+    def test_round_trips_page_mode(self):
+        for n in (256, 512, 65280):
+            assert proto.decode_length(proto.encode_length(n)) == n
+
+    def test_an_unrepresentable_length_raises(self):
+        """A wrong length field on a write is a frame the device may act on in
+        an unintended way — better to fail than to truncate."""
+        with pytest.raises(ValueError):
+            proto.encode_length(300)
+        with pytest.raises(ValueError):
+            proto.encode_length(-1)
+
+
+class TestLiveMonitorPresence:
+    """byte[0] is 0x80 for a real card and has bit 0x40 set for an address
+    past the end of a chain. Verified on a chain known to hold exactly 22
+    panels: cards 0-21 answered 0x80, cards 22-25 answered 0xE0/0xE2/0xE4/0xE6
+    while repeating the last card's readings."""
+
+    def _payload(self, status, temp_raw=84, volt_raw=170, link=1):
+        b = bytearray(82)
+        b[0] = status
+        b[1] = temp_raw
+        b[3] = volt_raw
+        b[12] = link
+        return bytes(b)
+
+    def test_present_status(self):
+        assert proto.live_monitor_present(0x80) is True
+
+    def test_absent_statuses_observed_on_hardware(self):
+        for status in (0xC0, 0xE0, 0xE2, 0xE4, 0xE6):
+            assert proto.live_monitor_present(status) is False, hex(status)
+
+    def test_parse_exposes_present_separately_from_online(self):
+        absent = proto.parse_live_monitoring(self._payload(0xE0))
+        assert absent["present"] is False
+        # `online` is the looser legacy test and still sees the high bit —
+        # which is exactly why `present` had to be added.
+        assert absent["online"] is True
+
+    def test_an_absent_address_still_carries_plausible_readings(self):
+        """The trap: it repeats the previous card's values. Anything that
+        gates on 'the device answered' invents a panel here."""
+        absent = proto.parse_live_monitoring(self._payload(0xE0, temp_raw=86))
+        assert absent["temperature_c"] == 43.0
+        assert absent["present"] is False
+
+    def test_readings_decode_as_the_capture_showed(self):
+        """raw 84 → 42.0 °C (÷2) and raw 170 → 4.2 V (lower 7 bits × 0.1),
+        both per the vendor doc §4.3.4 / §5.4.2."""
+        r = proto.parse_live_monitoring(self._payload(0x80, 84, 170))
+        assert r["present"] is True
+        assert r["temperature_c"] == 42.0
+        assert r["voltage_v"] == 4.2
+
+
+class TestLinkStatus:
+    """A NovaLCT capture of a healthy 286-card wall showed byte[12] == 1 on
+    162 cards and 11 on the other 124. Mapping "anything else" to
+    DISCONNECTED labelled 124 working panels as disconnected."""
+
+    def _with_link(self, link):
+        b = bytearray(82)
+        b[0] = 0x80
+        b[12] = link
+        return proto.parse_live_monitoring(bytes(b))["link_status"]
+
+    def test_documented_values(self):
+        assert self._with_link(1) == "PRIMARY"
+        assert self._with_link(2) == "BACKUP"
+
+    def test_zero_is_disconnected(self):
+        assert self._with_link(0) == "DISCONNECTED"
+
+    def test_the_observed_eleven_is_not_called_disconnected(self):
+        assert self._with_link(11) == "UNKNOWN"
+
+    def test_other_unrecognised_values_are_unknown_not_a_fault(self):
+        for v in (3, 7, 11, 200, 255):
+            assert self._with_link(v) == "UNKNOWN", v

@@ -12,6 +12,7 @@ import os
 import socket
 import struct
 import threading
+import time
 from argparse import Namespace
 from datetime import datetime
 
@@ -48,6 +49,7 @@ class FakeSenderCard:
         self.silent_absent = silent_absent
         self.drop = dict(drop or {})
         self.probes = []          # every (chain, card) the client asked about
+        self.sender_cards_seen = []   # byte[5] of every request
         self.connections = 0
         self._lock = threading.Lock()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -113,10 +115,12 @@ class FakeSenderCard:
     def _respond(self, req):
         chain = req[7]
         card = req[8]
+        sender_card = req[5]
         register = struct.unpack(">I", req[12:16])[0]
         length_field = struct.unpack(">H", req[16:18])[0]
         with self._lock:
             self.probes.append((chain, card))
+            self.sender_cards_seen.append(sender_card)
             remaining = self.drop.get((chain, card), 0)
             if remaining:
                 self.drop[(chain, card)] = remaining - 1
@@ -136,7 +140,11 @@ class FakeSenderCard:
             body = bytes([0x05 if present else 0x00, 0x00, 0x00])
         elif register == REG_LIVE_MONITOR[0]:
             body = bytearray(size)
-            body[0] = 0x80          # online bit
+            # 0x80 present / 0xE0 past the end of the chain. Real hardware
+            # still returns the previous card's readings behind the absent
+            # flag, so the stub does too — a decoder that ignores byte[0]
+            # must fail here.
+            body[0] = 0x80 if present else 0xE0
             body[1] = 88            # 44.0 C
             body[3] = 170           # 5.10 V
             body[12] = 1            # PRIMARY
@@ -174,9 +182,10 @@ class FakeSenderCard:
             return [c for ch, c in self.probes if ch == chain]
 
 
-def make_probe(server, register="biterr", timeout=0.15):
+def make_probe(server, register="biterr", timeout=0.15, pace=0):
     return ew.BinarySenderCardProbe("127.0.0.1", server.port, timeout=timeout,
-                                    connect_timeout=1.0, register=register)
+                                    connect_timeout=1.0, register=register,
+                                    pace=pace)
 
 
 # ── Fake JSON client ──────────────────────────────────────────────────────
@@ -252,13 +261,15 @@ class TestChainBoundary:
         # Real hardware may simply not answer for a card that isn't there.
         with FakeSenderCard({0: 3}, silent_absent=True) as server:
             with make_probe(server, timeout=0.05) as probe:
-                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0)
+                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0,
+                                           silence_rests=0)
         assert len(cards) == 3
 
     def test_silent_absent_empty_chain_yields_zero(self):
         with FakeSenderCard({0: 0}, silent_absent=True) as server:
             with make_probe(server, timeout=0.05) as probe:
-                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0)
+                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0,
+                                           silence_rests=0)
         assert cards == []
 
     def test_transient_drop_mid_chain_is_recovered_by_retry(self):
@@ -266,16 +277,35 @@ class TestChainBoundary:
         with FakeSenderCard({0: 6}, silent_absent=True,
                             drop={(0, 2): 1}) as server:
             with make_probe(server, timeout=0.05) as probe:
-                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=2)
+                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=2,
+                                           silence_rests=0)
         assert len(cards) == 6
 
     def test_without_retries_a_dropped_response_under_reports(self):
-        # Documents exactly why --retries defaults to 2.
+        # Documents why --retries defaults to 2. --silence-rests would also
+        # have caught this one; it is disabled here to isolate the retry.
         with FakeSenderCard({0: 6}, silent_absent=True,
                             drop={(0, 2): 1}) as server:
             with make_probe(server, timeout=0.05) as probe:
-                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0)
+                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0,
+                                           silence_rests=0)
         assert len(cards) == 2
+
+    def test_silence_rests_recover_a_drop_that_outlasts_the_retries(self):
+        # Same 6-card chain, but the drop survives every retry. Without a rest
+        # the chain truncates to 2; with one it comes back whole.
+        with FakeSenderCard({0: 6}, silent_absent=True,
+                            drop={(0, 2): 3}) as server:
+            with make_probe(server, timeout=0.05) as probe:
+                slept = []
+                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=2,
+                                           silence_rests=2, rest_seconds=9.0,
+                                           sleep=slept.append)
+        assert len(cards) == 6
+        # One rest recovers card 2; this stub is also silent at the real
+        # boundary (card 6), which spends the full allowance before the walk
+        # accepts it.
+        assert slept == [9.0, 9.0, 9.0]
 
     def test_max_cards_cap_warns_instead_of_silently_truncating(self):
         warnings = []
@@ -299,8 +329,7 @@ class TestChainBoundary:
 
 class TestProbeRegisters:
 
-    def test_bit_error_register_is_the_default(self):
-        assert ew.DEFAULT_PROBE_REGISTER == "biterr"
+    def test_bit_error_register_still_works_as_a_probe(self):
         with FakeSenderCard({0: 1}) as server:
             with make_probe(server) as probe:
                 assert probe.register == H_REG_BIT_ERRORS[0]
@@ -314,12 +343,461 @@ class TestProbeRegisters:
                 result = probe.probe(0, 0)
         assert result.present
         assert result.readings["temp_c"] == 44.0
-        assert result.readings["voltage_v"] == 5.1
+        # raw 170 & 0x7F = 42, units of 0.1 V → 4.2 V. Vendor doc §4.3.4.
+        assert result.readings["voltage_v"] == 4.2
         assert result.readings["link_status"] == "PRIMARY"
 
     def test_unknown_register_rejected(self):
         with pytest.raises(ValueError):
             ew.BinarySenderCardProbe("127.0.0.1", 5201, register="nope")
+
+    def test_live_register_reports_presence_from_byte0(self):
+        """0x80 present; bit 0x40 set means nothing at this address. Verified
+        on a chain known to hold exactly 22 panels: cards 0-21 answered 0x80
+        and 22-25 answered 0xE0/0xE2/0xE4/0xE6 while repeating the last card's
+        readings."""
+        payload = bytearray(82)
+        payload[0] = 0x80
+        payload[1] = 84          # 42.0 C  (84 / 2)
+        payload[3] = 170         # 4.20 V  (170 & 0x7F = 42, units of 0.1 V)
+        payload[12] = 1
+        present, readings = ew._presence_live_monitor(bytes(payload))
+        assert present is True
+        assert readings["temp_c"] == 42.0
+        assert readings["voltage_v"] == 4.2
+        assert readings["link_status"] == "PRIMARY"
+
+    def test_an_address_past_the_end_of_a_chain_is_absent(self):
+        for status in (0xC0, 0xE0, 0xE2, 0xE4, 0xE6):
+            payload = bytearray(82)
+            payload[0] = status
+            payload[1] = 86      # the previous card's reading, repeated
+            present, readings = ew._presence_live_monitor(bytes(payload))
+            assert present is False, hex(status)
+            # and crucially no readings, so nothing invents a 43 C panel
+            # for an address with nothing on it
+            assert readings == {}, hex(status)
+
+    def test_live_is_the_default_because_it_also_yields_readings(self):
+        assert ew.DEFAULT_PROBE_REGISTER == "live"
+
+    def test_a_chain_walked_with_live_finds_the_right_length(self):
+        """The end-to-end check the old refusal was standing in for: an
+        absent address answers, so the walk must stop on byte[0], not on
+        silence."""
+        with FakeSenderCard({0: 5}) as server:
+            with make_probe(server, register="live") as probe:
+                cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0,
+                                           silence_rests=0)
+        assert [c for c, _ in cards] == [0, 1, 2, 3, 4]
+        assert all(r["temp_c"] == 44.0 for _, r in cards)
+
+
+class TestSenderCardAddressing:
+    """Every sender card is read over ONE connection to 5201; byte[5] selects
+    which. The 5202/5203/5204 services the rqProMI reply advertises accept
+    connections but answer reads with an empty payload."""
+
+    def test_discovered_ports_map_to_zero_based_sender_card_bytes(self,
+                                                                  monkeypatch):
+        monkeypatch.setattr(ew, "discover_sender_card_ports",
+                            lambda *a, **k: [5201, 5202, 5203, 5204])
+        args = Namespace(ip="1.2.3.4", sender_cards=None,
+                         discovery_port=3800, discovery_timeout=0.1)
+        assert ew._resolve_sender_cards(args, ew.Reporter(0)) == {
+            1: 0, 2: 1, 3: 2, 4: 3}
+
+    def test_explicit_sender_cards_map_the_same_way(self):
+        args = Namespace(ip="1.2.3.4", sender_cards=[1, 3])
+        assert ew._resolve_sender_cards(args, ew.Reporter(0)) == {1: 0, 3: 2}
+
+    def test_probe_writes_the_sender_card_into_byte5(self):
+        with FakeSenderCard({0: 1}) as server:
+            probe = ew.BinarySenderCardProbe(
+                "127.0.0.1", server.port, timeout=0.15, connect_timeout=1.0,
+                sender_card=2, pace=0)
+            with probe:
+                probe.probe(0, 0)
+        assert server.sender_cards_seen == [2]
+
+    def test_every_sender_card_uses_the_same_tcp_port(self, monkeypatch,
+                                                      tmp_path):
+        factory = _FakeProbeFactory({0: {0: 2}, 1: {0: 3}})
+        monkeypatch.setattr(ew, "BinarySenderCardProbe", factory)
+        code = ew.main(["10.0.0.9", "--yes-contact-hardware",
+                        "--sender-cards", "1,2", "--chains", "0",
+                        "--no-json", "--retries", "0", "-q",
+                        "-o", str(tmp_path / "snap.json")])
+        assert code == ew.EXIT_OK
+        assert {p.tcp_port for p in factory.instances} == {ew.BINARY_PORT}
+        assert sorted(p.sender_card for p in factory.instances) == [0, 1]
+
+
+class TestSilenceIsNotABoundary:
+    """An answered "no card here" ends a chain. Silence does not — silence is
+    also what a degraded controller looks like, and accepting it is how a
+    22-card chain enumerated as 9."""
+
+    class _ScriptedProbe:
+        """Answers from a script of ProbeResults per (chain, card)."""
+
+        def __init__(self, script):
+            self.script = {k: list(v) for k, v in script.items()}
+            self.asked = []
+            self.probe_count = 0
+            self.sender_card = 0
+            self.tcp_port = ew.BINARY_PORT
+
+        def probe(self, chain, card):
+            self.probe_count += 1
+            self.asked.append((chain, card))
+            queue = self.script.get((chain, card))
+            if not queue:
+                return ew.ProbeResult(False, answered=True)
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    def _present(self):
+        return ew.ProbeResult(True, {"bit_errors": 0})
+
+    def _silent(self):
+        return ew.ProbeResult(False, answered=False)
+
+    def _absent(self):
+        return ew.ProbeResult(False, answered=True)
+
+    def test_silence_that_recovers_after_a_rest_does_not_truncate(self):
+        """Card 2 is silent through every retry, then answers after a rest.
+        The chain must come back as 4 cards, not 2."""
+        script = {
+            (0, 0): [self._present()],
+            (0, 1): [self._present()],
+            (0, 2): [self._silent(), self._silent(), self._silent(),
+                     self._present()],
+            (0, 3): [self._present()],
+            (0, 4): [self._absent()],
+        }
+        probe = self._ScriptedProbe(script)
+        slept = []
+        cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=2,
+                                   silence_rests=2, rest_seconds=7.0,
+                                   sleep=slept.append)
+        assert [c for c, _ in cards] == [0, 1, 2, 3]
+        assert slept == [7.0]
+
+    def test_answered_absence_ends_the_chain_without_resting(self):
+        script = {
+            (0, 0): [self._present()],
+            (0, 1): [self._absent()],
+        }
+        probe = self._ScriptedProbe(script)
+        slept = []
+        cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=2,
+                                   silence_rests=2, rest_seconds=7.0,
+                                   sleep=slept.append)
+        assert [c for c, _ in cards] == [0]
+        assert slept == []            # no rest paid for a real boundary
+        assert probe.asked == [(0, 0), (0, 1)]   # and no retries either
+
+    def test_persistent_silence_is_accepted_but_warned_as_a_lower_bound(self):
+        script = {
+            (0, 0): [self._present()],
+            (0, 1): [self._silent()],
+        }
+        probe = self._ScriptedProbe(script)
+        reporter = _CapturingReporter()
+        slept = []
+        cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=1,
+                                   silence_rests=2, rest_seconds=3.0,
+                                   reporter=reporter, sleep=slept.append)
+        assert [c for c, _ in cards] == [0]
+        assert slept == [3.0, 3.0]
+        assert any("LOWER BOUND" in w for w in reporter.warnings)
+        assert any("SILENCE" in w for w in reporter.warnings)
+
+    def test_silence_rests_zero_accepts_the_first_silence(self):
+        script = {(0, 0): [self._silent()]}
+        probe = self._ScriptedProbe(script)
+        slept = []
+        cards = ew.enumerate_chain(probe, 0, max_cards=91, retries=0,
+                                   silence_rests=0, rest_seconds=3.0,
+                                   sleep=slept.append)
+        assert cards == []
+        assert slept == []
+
+    def test_probe_timeout_default_covers_the_slow_empty_address(self):
+        """An empty address answers far slower than an occupied one; at 0.5s
+        every chain on the test wall ended on a timeout instead."""
+        assert ew.DEFAULT_PROBE_TIMEOUT >= 1.0
+
+
+class _CapturingReporter(ew.Reporter):
+    def __init__(self):
+        super().__init__(0)
+        self.warnings = []
+
+    def warn(self, message):
+        self.warnings.append(message)
+
+
+class TestVerifySilentChains:
+    """Silence during a sweep is ambiguous. Re-walking those chains one at a
+    time from a rested controller is what turns 20 back into the true 22."""
+
+    def test_silence_ended_chains_are_reported_to_the_caller(self):
+        probe = TestSilenceIsNotABoundary._ScriptedProbe({
+            (0, 0): [ew.ProbeResult(True, {}, answered=True)],
+            (0, 1): [ew.ProbeResult(False, answered=False)],
+        })
+        unresolved = []
+        ew.enumerate_sender_card_binary(
+            probe, 1, 20, [0], max_cards=91, retries=0, silence_rests=0,
+            unresolved=unresolved)
+        assert unresolved == [(1, 0, 1)]
+
+    def test_answered_boundary_is_not_reported_as_unresolved(self):
+        probe = TestSilenceIsNotABoundary._ScriptedProbe({
+            (0, 0): [ew.ProbeResult(True, {}, answered=True)],
+            (0, 1): [ew.ProbeResult(False, answered=True)],
+        })
+        unresolved = []
+        ew.enumerate_sender_card_binary(
+            probe, 1, 20, [0], max_cards=91, retries=0, silence_rests=0,
+            unresolved=unresolved)
+        assert unresolved == []
+
+    def _verify_args(self):
+        return Namespace(max_cards=91, retries=0, silence_rests=0,
+                         rest_seconds=0.0, verify_silent=True)
+
+    def test_a_longer_rested_result_replaces_the_swept_one(self):
+        """The sweep saw 1 card; the rested re-walk sees 3."""
+        rested = TestSilenceIsNotABoundary._ScriptedProbe({
+            (0, 0): [ew.ProbeResult(True, {}, answered=True)],
+            (0, 1): [ew.ProbeResult(True, {}, answered=True)],
+            (0, 2): [ew.ProbeResult(True, {}, answered=True)],
+            (0, 3): [ew.ProbeResult(False, answered=True)],
+        })
+        rested.open = lambda: rested
+        rested.close = lambda: None
+        swept_cards = [ew.make_card_entry(1, 20, 0, 0)]
+        slept = []
+        budget = ew.RequestBudget(size=5, rest=45.0, sleep=slept.append)
+        cards, probes = ew.verify_silent_chains(
+            [(1, 0, 1)], swept_cards, {1: 0}, {1: 20},
+            lambda sender_card: rested, budget, self._verify_args(),
+            ew.Reporter(0))
+        assert sorted(c["card_id"] for c in cards) == [0, 1, 2]
+        assert slept == [45.0]        # a full rest before the re-walk
+        assert probes == 4
+
+    def test_a_shorter_rested_result_never_removes_cards(self):
+        """A verification pass that is itself throttled must not make things
+        worse than the sweep already had them."""
+        throttled = TestSilenceIsNotABoundary._ScriptedProbe({
+            (0, 0): [ew.ProbeResult(False, answered=False)],
+        })
+        throttled.open = lambda: throttled
+        throttled.close = lambda: None
+        swept_cards = [ew.make_card_entry(1, 20, 0, i) for i in range(3)]
+        budget = ew.RequestBudget(size=5, rest=0.0, sleep=lambda _s: None)
+        cards, _ = ew.verify_silent_chains(
+            [(1, 0, 3)], swept_cards, {1: 0}, {1: 20},
+            lambda sender_card: throttled, budget, self._verify_args(),
+            ew.Reporter(0))
+        assert sorted(c["card_id"] for c in cards) == [0, 1, 2]
+
+    def test_verification_only_touches_the_chain_it_re_walked(self):
+        rested = TestSilenceIsNotABoundary._ScriptedProbe({
+            (0, 0): [ew.ProbeResult(True, {}, answered=True)],
+            (0, 1): [ew.ProbeResult(True, {}, answered=True)],
+            (0, 2): [ew.ProbeResult(False, answered=True)],
+        })
+        rested.open = lambda: rested
+        rested.close = lambda: None
+        other = [ew.make_card_entry(1, 20, 5, i) for i in range(4)]
+        swept_cards = [ew.make_card_entry(1, 20, 0, 0)] + other
+        budget = ew.RequestBudget(size=5, rest=0.0, sleep=lambda _s: None)
+        cards, _ = ew.verify_silent_chains(
+            [(1, 0, 1)], swept_cards, {1: 0}, {1: 20},
+            lambda sender_card: rested, budget, self._verify_args(),
+            ew.Reporter(0))
+        assert len([c for c in cards if c["port"] == 5]) == 4
+        assert len([c for c in cards if c["port"] == 0]) == 2
+
+    def test_a_connect_failure_keeps_the_swept_count(self):
+        def failing_factory(sender_card):
+            probe = TestSilenceIsNotABoundary._ScriptedProbe({})
+            probe.open = lambda: (_ for _ in ()).throw(OSError("refused"))
+            probe.close = lambda: None
+            return probe
+
+        swept_cards = [ew.make_card_entry(1, 20, 0, i) for i in range(2)]
+        budget = ew.RequestBudget(size=5, rest=0.0, sleep=lambda _s: None)
+        cards, _ = ew.verify_silent_chains(
+            [(1, 0, 2)], swept_cards, {1: 0}, {1: 20}, failing_factory,
+            budget, self._verify_args(), ew.Reporter(0))
+        assert len(cards) == 2
+
+
+class TestRequestBudget:
+    """The controller answers ~150-200 per-card reads then starts refusing,
+    and stays refusing. Rest before the budget runs out, not after."""
+
+    def test_no_rest_before_the_budget_is_spent(self):
+        slept = []
+        b = ew.RequestBudget(size=3, rest=45.0, sleep=slept.append)
+        for _ in range(3):
+            b.spend()
+        assert slept == []
+        assert b.spent == 3
+
+    def test_rest_when_the_next_request_would_exceed_the_budget(self):
+        slept = []
+        b = ew.RequestBudget(size=3, rest=45.0, sleep=slept.append)
+        for _ in range(4):
+            b.spend()
+        assert slept == [45.0]
+        assert b.spent == 1          # counter restarts after the rest
+        assert b.rests_taken == 1
+
+    def test_budget_is_shared_across_sender_cards(self):
+        """A fresh connection does not reset the controller's budget: sender
+        card 2 opened a new socket after card 1's sweep and got nothing."""
+        slept = []
+        b = ew.RequestBudget(size=4, rest=30.0, sleep=slept.append)
+        p1 = ew.BinarySenderCardProbe("127.0.0.1", 5201, sender_card=0,
+                                      pace=0, budget=b)
+        p2 = ew.BinarySenderCardProbe("127.0.0.1", 5201, sender_card=1,
+                                      pace=0, budget=b)
+        assert p1.budget is p2.budget is b
+
+    def test_size_zero_disables_resting(self):
+        slept = []
+        b = ew.RequestBudget(size=0, rest=45.0, sleep=slept.append)
+        for _ in range(50):
+            b.spend()
+        assert slept == []
+
+    def test_on_rest_is_notified(self):
+        events = []
+        b = ew.RequestBudget(size=2, rest=12.0, sleep=lambda _s: None,
+                             on_rest=lambda n, secs: events.append((n, secs)))
+        for _ in range(5):
+            b.spend()
+        assert events == [(1, 12.0), (2, 12.0)]
+
+    def test_probe_spends_the_budget(self):
+        slept = []
+        b = ew.RequestBudget(size=2, rest=8.0, sleep=slept.append)
+        with FakeSenderCard({0: 6}) as server:
+            probe = ew.BinarySenderCardProbe(
+                "127.0.0.1", server.port, timeout=0.15, connect_timeout=1.0,
+                pace=0, budget=b, sleep=slept.append)
+            with probe:
+                for card in range(4):
+                    probe.probe(0, card)
+        assert slept == [8.0]        # one rest after the 2-probe budget
+        assert probe.probe_count == 4
+
+    def test_defaults_are_conservative(self):
+        assert 0 < ew.DEFAULT_PROBE_BUDGET <= 200
+        assert ew.DEFAULT_BUDGET_REST >= 40
+
+
+class TestReadingsShareTheBudget:
+    """R0155 draws on the same controller allowance the binary reads do:
+    asking for 286 cards at once answered 36 and left it refusing for ~45 s."""
+
+    def _cards(self, count):
+        return [ew.make_card_entry(1, 20, 0, i) for i in range(count)]
+
+    def test_readings_are_chunked_to_the_budget_with_rests(self):
+        cards = self._cards(10)
+        client = FakeJSONClient(known={(20, 0, i) for i in range(10)})
+        slept = []
+        budget = ew.RequestBudget(size=4, rest=45.0, sleep=slept.append)
+        stats = ew.attach_readings(client, cards, budget=budget)
+        assert stats["answered"] == 10
+        assert slept == [45.0, 45.0]      # 4 + 4 + 2
+
+    def test_without_a_budget_the_old_single_call_path_is_used(self):
+        cards = self._cards(10)
+        client = FakeJSONClient(known={(20, 0, i) for i in range(10)})
+        stats = ew.attach_readings(client, cards)
+        assert stats["answered"] == 10
+        assert client.requested == [(20, 0, i) for i in range(10)]
+
+    def test_every_address_is_still_requested_exactly_once(self):
+        cards = self._cards(9)
+        client = FakeJSONClient(known={(20, 0, i) for i in range(9)})
+        budget = ew.RequestBudget(size=2, rest=0.0, sleep=lambda _s: None)
+        ew.attach_readings(client, cards, budget=budget)
+        assert client.requested == [(20, 0, i) for i in range(9)]
+
+
+class TestSilenceRestsDefault:
+    """Mid-sweep rests and the verification pass do the same job; running both
+    just makes the sweep slow. Whichever one is active must be a real defence."""
+
+    def _run(self, monkeypatch, tmp_path, *extra):
+        seen = {}
+        real = ew.enumerate_sender_card_binary
+
+        def spy(*a, **kw):
+            seen["silence_rests"] = kw.get("silence_rests")
+            return real(*a, **kw)
+
+        monkeypatch.setattr(ew, "enumerate_sender_card_binary", spy)
+        monkeypatch.setattr(ew, "BinarySenderCardProbe",
+                            _FakeProbeFactory({0: {0: 2}}))
+        ew.main(["10.0.0.9", "--yes-contact-hardware", "--sender-cards", "1",
+                 "--chains", "0", "--no-json", "--retries", "0", "-q",
+                 "-o", str(tmp_path / "snap.json")] + list(extra))
+        return seen["silence_rests"]
+
+    def test_verification_on_means_no_mid_sweep_rests(self, monkeypatch,
+                                                      tmp_path):
+        assert self._run(monkeypatch, tmp_path) == 0
+
+    def test_verification_off_restores_mid_sweep_rests(self, monkeypatch,
+                                                       tmp_path):
+        assert self._run(monkeypatch, tmp_path,
+                         "--no-verify-silent") == ew.DEFAULT_SILENCE_RESTS
+
+    def test_explicit_flag_wins_over_both(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, "--silence-rests", "5") == 5
+
+
+class TestProbePacing:
+    """The controller throttles under sustained polling, and a throttled probe
+    is indistinguishable from an absent card — which truncates chains."""
+
+    def test_pace_delays_between_probes(self):
+        with FakeSenderCard({0: 3}) as server:
+            probe = ew.BinarySenderCardProbe(
+                "127.0.0.1", server.port, timeout=0.15, connect_timeout=1.0,
+                pace=0.05)
+            with probe:
+                start = time.monotonic()
+                for card in range(4):
+                    probe.probe(0, card)
+                elapsed = time.monotonic() - start
+        assert elapsed >= 4 * 0.05
+
+    def test_pace_zero_does_not_sleep(self):
+        with FakeSenderCard({0: 3}) as server:
+            probe = ew.BinarySenderCardProbe(
+                "127.0.0.1", server.port, timeout=0.15, connect_timeout=1.0,
+                pace=0)
+            with probe:
+                start = time.monotonic()
+                for card in range(4):
+                    probe.probe(0, card)
+                elapsed = time.monotonic() - start
+        assert elapsed < 0.5
+
+    def test_default_pace_is_nonzero(self):
+        assert ew.DEFAULT_PROBE_PACE > 0
 
     def test_probe_on_unreachable_port_is_absent_not_an_exception(self):
         # Closed port: connect fails, and the probe must report absent rather
@@ -461,11 +939,26 @@ class TestSnapshotShape:
         assert parsed.utcoffset().total_seconds() == 0
 
     def test_sender_cards_block(self):
+        """`role` is None, not "primary". The test chassis has two primary and
+        two backup sender cards and nothing readable distinguishes them, so
+        claiming "primary" for every card is a guess dressed up as data."""
         snap = self._snapshot()
         assert snap["sender_cards"] == [
-            {"card_number": 1, "slot": 20, "user_slot": 21, "role": "primary"},
-            {"card_number": 2, "slot": 22, "user_slot": 23, "role": "primary"},
+            {"card_number": 1, "slot": 20, "user_slot": 21, "role": None,
+             "carrying_panels": True},
+            {"card_number": 2, "slot": 22, "user_slot": 23, "role": None,
+             "carrying_panels": True},
         ]
+
+    def test_a_sender_card_with_no_cards_is_recorded_as_not_carrying(self):
+        """An idle backup finds nothing. That is its normal state, so it is
+        recorded rather than dropped — and not called a fault."""
+        cards = [ew.make_card_entry(1, 20, 0, 0)]
+        snap = ew.build_snapshot("10.1.2.3", cards, {1: 20, 2: 22})
+        by_number = {c["card_number"]: c for c in snap["sender_cards"]}
+        assert by_number[1]["carrying_panels"] is True
+        assert by_number[2]["carrying_panels"] is False
+        assert by_number[2]["role"] is None
 
     def test_card_fields_match_the_existing_snapshot(self):
         snap = self._snapshot()
@@ -484,7 +977,7 @@ class TestSnapshotShape:
         snap = ew.build_snapshot("10.1.2.3", cards, {})
         assert snap["sender_cards"] == [
             {"card_number": 3, "slot": None, "user_slot": None,
-             "role": "primary"}]
+             "role": None, "carrying_panels": True}]
 
 
 # ── Atomic write ──────────────────────────────────────────────────────────
@@ -536,21 +1029,25 @@ class TestAttachReadings:
         assert stats == {"requested": 2, "answered": 2, "silent": 0,
                          "skipped": 0}
         assert cards[0]["temp_c"] == 44.0
-        assert cards[0]["voltage_v"] == 5.1
+        # raw 170 & 0x7F = 42, units of 0.1 V → 4.2 V. Vendor doc §5.4.2.
+        assert cards[0]["voltage_v"] == 4.2
         assert cards[0]["brightness"] == 127
         assert cards[0]["primary_power_ok"] is True
         assert cards[0]["online"] is True
 
     def test_unreadable_cards_are_kept_not_dropped(self):
         # The whole point: a card that exists but can't be read is a finding,
-        # not a card to delete from the snapshot.
+        # not a card to delete from the snapshot. It is recorded as UNKNOWN
+        # rather than offline — the binary walk proved it is there, and R0155
+        # going quiet is a statement about R0155, not about the panel.
         cards = [ew.make_card_entry(1, 20, 0, i) for i in range(3)]
         client = FakeJSONClient(known={(20, 0, 0)})
         stats = ew.attach_readings(client, cards)
         assert len(cards) == 3
         assert stats["answered"] == 1 and stats["silent"] == 2
-        assert cards[1]["online"] is False
-        assert cards[2]["online"] is False
+        assert cards[1]["online"] is None
+        assert cards[1]["reading"] == "no_answer"
+        assert cards[2]["online"] is None
 
     def test_fully_silent_chain_warns_loudly(self):
         warnings = []
@@ -722,8 +1219,11 @@ class TestConfirmationFlag:
         _code, out, _err, _fired = self._capture(
             ["10.9.9.9", "--sender-cards", "1,2,3"], monkeypatch)
         assert "10.9.9.9" in out
+        # One TCP target for every sender card — they are distinguished by
+        # byte[5] of the frame, not by port, so 5202/5203 must NOT appear.
         assert "10.9.9.9:5201" in out
-        assert "10.9.9.9:5203" in out
+        assert "5202" not in out and "5203" not in out
+        assert "sender cards 1, 2, 3" in out
         assert "--yes-contact-hardware" in out
         assert "Nothing is written to the device" in out
 
@@ -777,22 +1277,28 @@ class TestArgParsing:
 
 
 class _FakeProbeFactory:
-    """Drop-in for BinarySenderCardProbe backed by a chain map per TCP port."""
+    """Drop-in for BinarySenderCardProbe backed by a chain map per sender card.
 
-    def __init__(self, per_port):
-        self.per_port = per_port
+    Keyed on the 0-based `sender_card` byte, not on a TCP port: every sender
+    card is read over the one connection to 5201 and selected by byte[5].
+    """
+
+    def __init__(self, per_sender_card):
+        self.per_sender_card = per_sender_card
         self.instances = []
 
     def __call__(self, ip, tcp_port, timeout=None, connect_timeout=None,
-                 register="biterr"):
-        probe = _FakeProbe(tcp_port, self.per_port.get(tcp_port, {}))
+                 register="biterr", sender_card=0, pace=0, budget=None):
+        probe = _FakeProbe(tcp_port, sender_card,
+                           self.per_sender_card.get(sender_card, {}))
         self.instances.append(probe)
         return probe
 
 
 class _FakeProbe:
-    def __init__(self, tcp_port, chains):
+    def __init__(self, tcp_port, sender_card, chains):
         self.tcp_port = tcp_port
+        self.sender_card = sender_card
         self.chains = chains
         self.probe_count = 0
 
@@ -805,7 +1311,10 @@ class _FakeProbe:
     def probe(self, chain, card_index):
         self.probe_count += 1
         present = card_index < self.chains.get(chain, 0)
-        return ew.ProbeResult(present, {"bit_errors": 0} if present else {})
+        # answered=True: this stub always replies, so an absence here is a real
+        # boundary and must not trigger the silence rests.
+        return ew.ProbeResult(present, {"bit_errors": 0} if present else {},
+                              answered=True)
 
 
 class TestEndToEnd:
@@ -816,7 +1325,7 @@ class TestEndToEnd:
                 "-q", "-o", str(tmp_path / "snap.json")] + list(extra)
 
     def test_writes_a_snapshot(self, monkeypatch, tmp_path, capsys):
-        factory = _FakeProbeFactory({5201: {0: 4, 1: 2}, 5202: {2: 3}})
+        factory = _FakeProbeFactory({0: {0: 4, 1: 2}, 1: {2: 3}})
         monkeypatch.setattr(ew, "BinarySenderCardProbe", factory)
         code = ew.main(self._argv(tmp_path))
         assert code == ew.EXIT_OK
@@ -830,17 +1339,21 @@ class TestEndToEnd:
 
         summary = capsys.readouterr().out
         assert "TOTAL CARDS       : 9" in summary
-        assert "sender card 1 (slot None): 6 cards" in summary
+        # Slot is derived from the card number via the chassis layout
+        # (card N is slot 20 + 2(N-1)), so it is known even with --no-json.
+        assert "sender card 1 (slot 20): 6 cards" in summary
 
     def test_slot_map_flows_into_the_snapshot(self, monkeypatch, tmp_path):
-        factory = _FakeProbeFactory({5201: {0: 1}, 5202: {0: 1}})
+        factory = _FakeProbeFactory({0: {0: 1}, 1: {0: 1}})
         monkeypatch.setattr(ew, "BinarySenderCardProbe", factory)
         code = ew.main(self._argv(tmp_path, "--slot-map", "1=20,2=22"))
         assert code == ew.EXIT_OK
         snap = json.loads((tmp_path / "snap.json").read_text())
         assert snap["sender_cards"] == [
-            {"card_number": 1, "slot": 20, "user_slot": 21, "role": "primary"},
-            {"card_number": 2, "slot": 22, "user_slot": 23, "role": "primary"},
+            {"card_number": 1, "slot": 20, "user_slot": 21, "role": None,
+             "carrying_panels": True},
+            {"card_number": 2, "slot": 22, "user_slot": 23, "role": None,
+             "carrying_panels": True},
         ]
         assert {c["slot"] for c in snap["cards"]} == {20, 22}
 
@@ -848,7 +1361,7 @@ class TestEndToEnd:
             self, monkeypatch, tmp_path):
         target = tmp_path / "snap.json"
         target.write_text('{"cards": ["previous"]}')
-        factory = _FakeProbeFactory({5201: {}, 5202: {}})
+        factory = _FakeProbeFactory({0: {}, 1: {}})
         monkeypatch.setattr(ew, "BinarySenderCardProbe", factory)
         code = ew.main(self._argv(tmp_path))
         assert code == ew.EXIT_ERROR
@@ -858,7 +1371,8 @@ class TestEndToEnd:
         """Full binary path including sockets and frame parsing."""
         with FakeSenderCard({0: 3, 1: 0, 2: 5}) as server:
             args = Namespace(
-                ip="127.0.0.1", sender_cards=[server.port - 5200],
+                ip="127.0.0.1", sender_cards=[1],
+                binary_port=server.port, pace=0,
                 chains=[0, 1, 2], max_cards=91, retries=0,
                 timeout=0.15, connect_timeout=1.0, probe_register="biterr",
                 no_json=True, no_readings=True, json_port=6000,
@@ -903,3 +1417,178 @@ def test_default_output_is_next_to_the_app_source():
     assert os.path.basename(path) == "wall_live_snapshot.json"
     assert os.path.dirname(path) == os.path.dirname(
         os.path.abspath(ew.__file__))
+
+
+class TestAbsentAddressesCarryNoReadings:
+    """An absent address answers with the same `?? 56 00` shape the
+    free-running counter produces, which decodes to 86 bit errors for a card
+    that is not there."""
+
+    def test_absent_yields_no_readings(self):
+        present, readings = ew._presence_bit_errors(bytes([0xD7, 0x56, 0x00]))
+        assert present is False
+        assert readings == {}
+
+    def test_present_yields_the_count(self):
+        present, readings = ew._presence_bit_errors(bytes([0x05, 0x91, 0x00]))
+        assert present is True
+        assert readings["bit_errors"] == 0x0091
+        assert readings["bit_errors_saturated"] is False
+
+    def test_a_clean_card_reads_zero_not_absent(self):
+        present, readings = ew._presence_bit_errors(bytes([0x05, 0x00, 0x00]))
+        assert present is True
+        assert readings["bit_errors"] == 0
+
+
+class TestSlotToCardNumber:
+    """Output cards occupy every second slot from 20. Getting this wrong meant
+    the two backup cards were never scanned: the rqProMI port list numbered
+    them 1..4, so the enumerator probed byte[5] 0-3 while the real cards were
+    1, 2, 5 and 6 — byte[5] 0, 1, 4 and 5."""
+
+    def test_the_operator_confirmed_mapping(self):
+        assert ew.slot_to_card_number(20) == 1
+        assert ew.slot_to_card_number(22) == 2
+        assert ew.slot_to_card_number(28) == 5
+        assert ew.slot_to_card_number(30) == 6
+
+    def test_intermediate_slots_are_the_cards_between(self):
+        assert ew.slot_to_card_number(24) == 3
+        assert ew.slot_to_card_number(26) == 4
+
+    def test_odd_and_low_slots_are_not_output_cards(self):
+        assert ew.slot_to_card_number(21) is None
+        assert ew.slot_to_card_number(19) is None
+        assert ew.slot_to_card_number(0) is None
+        assert ew.slot_to_card_number(None) is None
+
+    def test_sender_cards_come_from_slots_not_discovery_ports(self,
+                                                              monkeypatch):
+        """The four rqProMI services would have said 1, 2, 3, 4."""
+        monkeypatch.setattr(ew, "discover_sender_card_ports",
+                            lambda *a, **k: [5201, 5202, 5203, 5204])
+        args = Namespace(ip="1.2.3.4", sender_cards=None,
+                         discovery_port=3800, discovery_timeout=0.1,
+                         _topology_slots=[20, 22, 28, 30])
+        assert ew._resolve_sender_cards(args, ew.Reporter(0)) == {
+            1: 0, 2: 1, 5: 4, 6: 5}
+
+    def test_discovery_is_the_fallback_and_says_so(self):
+        warnings = []
+        reporter = ew.Reporter(0)
+        reporter.warn = warnings.append
+        args = Namespace(ip="127.0.0.1", sender_cards=None,
+                         discovery_port=1, discovery_timeout=0.05,
+                         _topology_slots=[])
+        ew._resolve_sender_cards(args, reporter)
+        assert warnings
+
+    def test_slot_map_pairs_card_with_its_own_slot(self):
+        """Zipping sorted card numbers against sorted slots put card 5 with
+        slot 28's list position rather than with slot 28."""
+        assert ew.resolve_slot_map([1, 2, 5, 6], [20, 22, 28, 30]) == {
+            1: 20, 2: 22, 5: 28, 6: 30}
+
+
+class TestSilentR0155IsNotOffline:
+    """A 286-card readings pass answered 36 and then hit the request budget.
+    Recording the other 250 as `online: False` put "250 panels offline" on a
+    dashboard for a wall where every panel was lit."""
+
+    def _cards(self, n):
+        return [ew.make_card_entry(1, 20, 0, i) for i in range(n)]
+
+    def test_a_silent_card_is_unknown_not_offline(self):
+        cards = self._cards(3)
+        client = FakeJSONClient(known={(20, 0, 0)})
+        stats = ew.attach_readings(client, cards)
+        assert stats == {"requested": 3, "answered": 1, "silent": 2,
+                         "skipped": 0}
+        assert cards[0]["online"] is True
+        assert cards[1]["online"] is None
+        assert cards[2]["online"] is None
+
+    def test_silence_is_labelled_so_the_ui_need_not_guess(self):
+        cards = self._cards(2)
+        stats = ew.attach_readings(FakeJSONClient(known={(20, 0, 0)}), cards)
+        assert stats["answered"] == 1
+        assert cards[0]["reading"] == "ok"
+        assert cards[1]["reading"] == "no_answer"
+
+    def test_presence_survives_a_silent_reading(self):
+        """The binary walk proved the card is there. R0155 declining to talk
+        about it does not un-prove that."""
+        cards = self._cards(2)
+        ew.attach_readings(FakeJSONClient(known=set()), cards)
+        assert all(c["present"] is True for c in cards)
+
+    def test_a_card_the_walk_found_is_marked_present(self):
+        assert ew.make_card_entry(1, 20, 0, 0)["present"] is True
+
+    def test_silent_cards_carry_no_invented_readings(self):
+        cards = self._cards(2)
+        ew.attach_readings(FakeJSONClient(known=set()), cards)
+        for c in cards:
+            assert "temp_c" not in c and "voltage_v" not in c
+
+
+class TestReadingsPassIsSkippedWhenRedundant:
+    """The `live` walk already returns temperature and voltage per card. Doing
+    an R0155 pass afterwards re-asks the same questions over the protocol the
+    controller rate-limits hardest — and spends the budget doing it. On a
+    286-card wall that pass answered 36."""
+
+    def _args(self, tmp_path, **over):
+        base = dict(ip="10.0.0.9", sender_cards=[1], binary_port=1,
+                    pace=0, chains=[0], max_cards=91, retries=0,
+                    timeout=0.05, connect_timeout=0.2,
+                    probe_register="live", no_json=False, no_readings=False,
+                    json_port=6000, discovery_port=3800,
+                    discovery_timeout=0.05, verify_silent=False,
+                    silence_rests=0, probe_budget=0, budget_rest=0)
+        base.update(over)
+        return Namespace(**base)
+
+    def test_a_walk_that_returned_readings_skips_r0155(self, monkeypatch):
+        client = FakeJSONClient(known={(20, 0, 0)})
+        monkeypatch.setattr(ew, "HSeriesJSONClient", lambda *a, **k: client)
+        monkeypatch.setattr(ew, "fetch_topology", lambda *a, **k: {"slots": [20]})
+        monkeypatch.setattr(ew, "BinarySenderCardProbe",
+                            _FakeProbeFactoryWithReadings({0: {0: 3}}))
+        result, error = ew.run_binary(self._args(None), ew.Reporter(0), None)
+        assert error is None
+        # Not one R0155 was sent.
+        assert client.requested == []
+
+    def test_a_walk_with_no_readings_still_falls_back_to_r0155(self,
+                                                               monkeypatch):
+        client = FakeJSONClient(known={(20, 0, 0)})
+        monkeypatch.setattr(ew, "HSeriesJSONClient", lambda *a, **k: client)
+        monkeypatch.setattr(ew, "fetch_topology", lambda *a, **k: {"slots": [20]})
+        monkeypatch.setattr(ew, "BinarySenderCardProbe",
+                            _FakeProbeFactory({0: {0: 3}}))
+        ew.run_binary(self._args(None, probe_register="biterr"),
+                      ew.Reporter(0), None)
+        assert client.requested   # the biterr walk carries no temps
+
+
+class _FakeProbeFactoryWithReadings(_FakeProbeFactory):
+    """Like the plain fake, but answers with temperature/voltage the way the
+    `live` register does."""
+
+    def __call__(self, ip, tcp_port, timeout=None, connect_timeout=None,
+                 register="live", sender_card=0, pace=0, budget=None):
+        probe = _FakeProbeWithReadings(tcp_port, sender_card,
+                                       self.per_sender_card.get(sender_card, {}))
+        self.instances.append(probe)
+        return probe
+
+
+class _FakeProbeWithReadings(_FakeProbe):
+    def probe(self, chain, card_index):
+        self.probe_count += 1
+        present = card_index < self.chains.get(chain, 0)
+        readings = ({"temp_c": 42.0, "voltage_v": 5.1, "online": True}
+                    if present else {})
+        return ew.ProbeResult(present, readings, answered=True)

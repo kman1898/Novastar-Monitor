@@ -29,3 +29,7 @@ src/error_log.json
 src/wall_config.json
 src/wall_layout.json
 src/wall_live_snapshot.json
+
+# Backups and pre-upgrade copies of the runtime state above.
+src/error_log.json.*
+src/wall_live_snapshot.json.*

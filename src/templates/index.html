@@ -7,7 +7,7 @@
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
 <title>NovaStar Monitor — Wall</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=20260808a">
+<link rel="stylesheet" href="{{ asset_url('css/style.css') }}">
 <!--
   DEPLOYMENT RISK — socket.io client is loaded from a public CDN.
   LED walls routinely run on isolated show networks with no internet route, and
@@ -31,7 +31,35 @@
     <span id="topbar-info">Connecting...</span>
     <div class="pulse" id="pulse-dot"></div>
     <button class="btn btn-sm" data-action="add-device-show">+ Add Device</button>
+    <!--
+      EMERGENCY STOP. Lives in the sticky topbar so it is on screen on every
+      tab, at every scroll position, without opening a menu: this is what the
+      operator reaches for when the monitor is interfering with a live show
+      (it once locked them out of Bitfocus Companion mid-show). It is
+      deliberately not a toggle switch — a switch invites an idle flick, and
+      both directions of a switch look alike. Halting is one click with no
+      confirmation; resuming asks first, because resuming is the direction
+      that puts packets back on the wire.
+    -->
+    <button type="button" id="halt-btn" class="halt-btn" data-action="halt-toggle"
+            aria-pressed="false" title="Stop all contact with every device">
+      <span class="halt-btn-icon" aria-hidden="true">■</span>
+      <span class="halt-btn-label" id="halt-btn-label">STOP CONTACT</span>
+    </button>
   </div>
+</div>
+
+<!--
+  Halted banner. The stop button alone is not enough: with contact halted every
+  reading on screen is frozen, and frozen data looks exactly like calm data.
+  This bar states it across the full width, above everything, until resumed.
+-->
+<div id="halt-banner" class="halt-banner" role="status" aria-live="assertive">
+  <span class="halt-banner-flag">CONTACT HALTED</span>
+  <span class="halt-banner-text" id="halt-banner-text">
+    No packets are being sent to any device. Everything below is frozen at the last reading.
+  </span>
+  <button class="btn btn-sm" data-action="halt-resume">Resume contact</button>
 </div>
 
 <!-- Connection / degraded-mode banner -->
@@ -107,6 +135,14 @@
       <div class="section-title" style="flex-wrap:wrap;">
         <span id="wall-name" style="font-size:16px;">Loading wall…</span>
         <span class="badge badge-info" id="wall-card-count">— cards</span>
+        <!--
+          Age of the per-card readings the cells are coloured by. Separate from
+          the Live/Snapshot badge on the wall name, which describes the device
+          connection: since per-card temperature/voltage stopped being polled
+          on a timer, a connected device and fresh cell colours are no longer
+          the same claim. Filled in by wall_view.js.
+        -->
+        <span class="badge" id="wall-cards-age">card data: —</span>
       </div>
 
       <!-- Wall controls row -->
@@ -117,7 +153,48 @@
           <button class="pill" data-val="power">Power</button>
           <button class="pill" data-val="online">Online</button>
         </div>
+        <!--
+          Per-card reads are on demand only now. The whole-wall read is rate
+          limited server-side; per-chain buttons live on each port row.
+        -->
+        <button class="btn btn-sm" id="wall-refresh-all" data-wall-action="refresh-all"
+                title="Read temperature, voltage and link status for every card on the wall over the binary path — this covers all cards, unlike the JSON route which the controller cuts off after ~150">
+          ⟳ Refresh all cards
+        </button>
+        <!--
+          Bit errors are a separate read: binary-only, with no R0155
+          equivalent, and the only signal that shows a data break which a
+          backup sender card is otherwise hiding.
+        -->
+        <button class="btn btn-sm" id="wall-read-bit-errors" data-wall-action="read-bit-errors"
+                title="Read the per-card bit-error counters. This is what locates a data break: the first affected panel on a chain is where the signal path broke.">
+          ⚡ Read bit errors
+        </button>
+        <button class="btn btn-sm" id="wall-zero-bit-errors" data-wall-action="zero-bit-errors"
+                title="Start counting bit errors from now, in this dashboard only. The controller's own cumulative counters are NOT touched.">
+          ⌀ Zero counters (local)
+        </button>
+        <span id="wall-refresh-status" class="wall-refresh-status"></span>
       </div>
+
+      <!--
+        Read progress. A whole-wall pass is 286 sequential per-card reads with
+        a 45 s pause partway; without this it is indistinguishable from a hang.
+        Populated by wall_view.js from the `read_progress` socket event.
+      -->
+      <div id="read-progress" class="read-progress" hidden>
+        <div class="read-progress-head">
+          <span id="read-progress-label"></span>
+          <span id="read-progress-count"></span>
+        </div>
+        <div class="read-progress-track">
+          <div id="read-progress-bar" class="read-progress-bar"></div>
+        </div>
+        <div id="read-progress-note" class="read-progress-note"></div>
+      </div>
+
+      <!-- Stale per-card data notice (populated by wall_view.js) -->
+      <div id="wall-stale-note" class="wall-stale-note"></div>
 
       <!-- Aggregate stats bar (populated by wall_view.js) -->
       <div id="wall-stats" class="wall-stats"></div>
@@ -186,12 +263,24 @@
           <input type="number" id="set-temp-crit" class="input" step="1" value="75">
         </div>
         <div class="info-item">
-          <label>Minimum Voltage (V)</label>
-          <input type="number" id="set-volt-min" class="input" step="0.1" value="4.7">
+          <!--
+            Mirrors DEFAULT_VOLTAGE_MIN in app.py (3.8). 4.7 — the value that
+            used to sit here — is above the whole healthy band these cards
+            report and alarmed on every one of them; app.py now keeps it only
+            as LEGACY_VOLTAGE_MIN so old settings files can be migrated off it.
+          -->
+          <label>Minimum Voltage (V) — healthy cards read ~4.1–4.4 V</label>
+          <input type="number" id="set-volt-min" class="input" step="0.1" value="3.8">
         </div>
         <div class="info-item">
-          <label>Poll Interval (seconds) — typical: 5–30</label>
-          <input type="number" id="set-poll-int" class="input" step="1" min="3" max="300" value="10">
+          <!--
+            Range mirrors MIN_POLL_INTERVAL / MAX_POLL_INTERVAL in app.py
+            (1–3600); the server clamps to the same bounds, so a field that
+            rejected values the server accepts only hid legal settings.
+            The default mirrors DEFAULT_POLL_INTERVAL in device_manager.py.
+          -->
+          <label>Poll Interval (seconds) — typical: 10–60</label>
+          <input type="number" id="set-poll-int" class="input" step="1" min="1" max="3600" value="30">
         </div>
       </div>
       <button class="btn btn-primary" style="margin-top:12px;" data-action="save-settings">Save Settings</button>
@@ -220,7 +309,7 @@
   </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/app.js') }}?v=20260808a"></script>
-<script src="{{ url_for('static', filename='js/wall_view.js') }}?v=20260808a"></script>
+<script src="{{ asset_url('js/app.js') }}"></script>
+<script src="{{ asset_url('js/wall_view.js') }}"></script>
 </body>
 </html>

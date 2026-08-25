@@ -190,6 +190,17 @@ body {
   color: var(--text-dim);
   margin-top: 4px;
 }
+/* Coverage qualifier under a stat value — "22 of 286 cards read".
+   Only rendered when the figure above it was computed over part of the wall,
+   so it is deliberately warning-coloured rather than dimmed: the whole point
+   is that the number above must not be read as the wall's. */
+.stat-note {
+  font-size: 10px;
+  color: var(--warning);
+  margin-top: 4px;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+}
 
 /* ── Tabs ── */
 .tabs {
@@ -764,3 +775,251 @@ label {
   box-shadow: var(--shadow-sm);
 }
 .legend-swatch.is-offline { box-shadow: 0 0 0 1.5px var(--danger); }
+
+/* ── Emergency stop ──
+ * The one control that stops every packet this app sends. It sits in the
+ * sticky topbar, so it is on screen on every tab at every scroll position,
+ * and it is styled to be findable by shape and colour alone: nothing else in
+ * the interface is a solid red block with a square glyph. It deliberately does
+ * not look like the neighbouring .btn — an emergency stop that reads as
+ * "another button in the row" is one the eye has to search for.
+ */
+.halt-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid #b91c1c;
+  background: linear-gradient(180deg, #dc2626 0%, #b91c1c 100%);
+  color: #fff;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 2px 10px -2px rgba(220, 38, 38, 0.6), var(--shadow-inset);
+  transition: background 0.12s ease, box-shadow 0.12s ease, transform 0.06s ease;
+}
+.halt-btn:hover { background: linear-gradient(180deg, #ef4444 0%, #c62828 100%); }
+.halt-btn:active { transform: translateY(0.5px); }
+.halt-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.halt-btn-icon { font-size: 11px; line-height: 1; }
+
+/* Halted: the button becomes the way back, and pulses so a frozen dashboard
+ * cannot be read as a quiet one. */
+.halt-btn.is-halted {
+  background: linear-gradient(180deg, #fbbf24 0%, #d97706 100%);
+  border-color: #b45309;
+  color: #1a1205;
+  animation: pulse-halt 1.6s infinite;
+}
+.halt-btn.is-halted:hover { background: linear-gradient(180deg, #fcd34d 0%, #ea9a08 100%); }
+/* Contact state not yet known — do not imply "running". */
+.halt-btn.is-unknown { opacity: 0.75; }
+.halt-btn.is-busy { opacity: 0.6; pointer-events: none; }
+
+@keyframes pulse-halt {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.6), var(--shadow-inset); }
+  50%      { box-shadow: 0 0 0 9px rgba(251, 191, 36, 0), var(--shadow-inset); }
+}
+
+/* Full-width statement that the data below is frozen. Sticky under the topbar
+ * so scrolling never leaves it behind. */
+.halt-banner {
+  display: none;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 28px;
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(251, 191, 36, 0.16) 0px,
+    rgba(251, 191, 36, 0.16) 12px,
+    rgba(251, 191, 36, 0.08) 12px,
+    rgba(251, 191, 36, 0.08) 24px
+  ), var(--bg-elevated);
+  border-bottom: 2px solid var(--warning);
+  position: sticky;
+  top: 59px;
+  z-index: 99;
+}
+.halt-banner.visible { display: flex; }
+.halt-banner-flag {
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: #1a1205;
+  background: var(--warning);
+  padding: 3px 10px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.halt-banner-text { font-size: 12.5px; color: var(--text); flex: 1; }
+
+/* Whole-page tell: a halted app is framed, so the state is legible from across
+ * a room, at any scroll position, and in a screenshot with the topbar cropped
+ * off. Fixed (not an inset shadow on <body>) so it stays a viewport frame
+ * rather than scrolling away with the document. pointer-events:none — it is a
+ * statement, never a click target. */
+body.contact-halted::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  border: 3px solid var(--warning);
+  pointer-events: none;
+  z-index: 400;
+}
+
+/* ── SNMP health: fans and PSUs ──
+ * Ten fans and four supplies are too many to read one at a time, so the
+ * verdict is written out above the strip and the strip is only there to say
+ * *which* unit. Nothing here renders speed_raw / voltage_raw as a measurement:
+ * both read 0 on a healthy wall and mean nothing on their own.
+ */
+.unit-block { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.unit-row { display: flex; gap: 12px; align-items: flex-start; }
+.unit-row-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  min-width: 42px;
+  padding-top: 3px;
+}
+.unit-row-body { flex: 1; }
+.unit-summary { font-size: 12px; font-weight: 600; margin-bottom: 5px; }
+.unit-note { font-size: 11.5px; padding-top: 2px; }
+.unit-strip { display: flex; flex-wrap: wrap; gap: 4px; }
+.unit-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-raised);
+  color: var(--text-muted);
+  cursor: default;
+}
+.unit-chip.unit-ok { background: var(--success-bg); color: var(--success); border-color: rgba(52, 211, 153, 0.28); }
+.unit-chip.unit-unknown { background: var(--bg-raised); color: var(--text-dim); }
+/* A failed unit is the point of the whole strip — it gets weight, a ring and
+ * a pulse rather than just a different hue. */
+.unit-chip.unit-bad {
+  background: var(--danger);
+  color: #1a0606;
+  border-color: var(--danger);
+  font-weight: 800;
+  box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.28);
+  animation: pulse-red 1.6s infinite;
+}
+.unit-footnote {
+  margin-top: 10px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.unit-footnote code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* ── Wall view: on-demand card refresh ── */
+.wall-refresh-status {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  flex: 1 1 100%;
+  line-height: 1.5;
+}
+#wall-refresh-all:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Per-chain read button, sized to sit inside a port row without pushing the
+ * chain of cells around. */
+.chain-refresh {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-raised);
+  color: var(--text-muted);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 5px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.chain-refresh:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.chain-refresh:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* Says out loud that the cell colours are not live. Hidden while the readings
+ * are fresh, because a warning that is always on stops being read. */
+.wall-stale-note {
+  display: none;
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  background: var(--warning-bg);
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.wall-stale-note.visible { display: block; }
+.wall-stale-note strong { color: var(--warning); }
+
+
+/* A card whose state was never read. Deliberately neutral: it is neither a
+   fault nor an all-clear, and colouring it either way is a claim we cannot
+   support. */
+.card-tile.unknown {
+  border-color: var(--border);
+  opacity: 0.75;
+}
+
+
+/* ── Per-card read progress ──────────────────────────────────────────────
+   A whole-wall read is minutes long and pauses for 45 s partway while the
+   controller recovers its request budget. The pause is the important part:
+   a bar that simply stops looks like a hang, and an operator who kills it
+   mid-show loses the pass and has spent the budget for nothing. */
+.read-progress {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.02));
+}
+.read-progress-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.read-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.read-progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--primary, #6366f1);
+  transition: width 0.2s linear;
+}
+.read-progress.is-resting .read-progress-bar { background: var(--warning); }
+.read-progress.is-done .read-progress-bar { background: var(--success); }
+.read-progress.is-halted .read-progress-bar { background: var(--danger); }
+.read-progress-note {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-height: 14px;
+}

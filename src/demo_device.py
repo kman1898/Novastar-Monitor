@@ -11,10 +11,17 @@ import time
 import math
 from datetime import datetime
 
-# Baselines from actual VX1000 Wireshark captures
+# Baselines from real captures, decoded with the vendor's documented formula.
+#
+# The voltages here used to be 5.16-5.22, which no receiving card can actually
+# report: they were the raw bytes (172-174) run through `raw * 0.03`, a formula
+# this project used before NovaStar's control protocol doc settled it as
+# (raw & 0x7F) * 0.1. Demo mode was therefore showing values live hardware
+# never produces, which is worse than useless for checking the UI's own
+# thresholds. Same raw bytes, correct arithmetic: 172 -> 4.4, 174 -> 4.6.
 _CARD_TEMPS_BASELINE = [55, 56, 58, 57, 59, 57, 58, 58, 57, 58, 57, 56, 56, 54]
-_CARD_VOLTS_BASELINE = [5.19, 5.19, 5.16, 5.16, 5.16, 5.19, 5.16, 5.19,
-                        5.19, 5.19, 5.22, 5.22, 5.19, 5.22]
+_CARD_VOLTS_BASELINE = [4.5, 4.5, 4.4, 4.4, 4.4, 4.5, 4.4, 4.5,
+                        4.5, 4.5, 4.6, 4.6, 4.5, 4.6]
 _CARD_COUNT = 14
 _MAC_PREFIX = "32:54:76:98:"
 

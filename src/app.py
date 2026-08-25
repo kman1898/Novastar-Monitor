@@ -3,7 +3,7 @@ NovaStar Monitor — Flask + SocketIO Backend
 Following the LED Raster Designer app pattern.
 """
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, url_for
 from flask_socketio import SocketIO, emit
 from werkzeug.exceptions import HTTPException
 import copy
@@ -142,6 +142,48 @@ def _handle_error(e):
     return jsonify({'error': 'Internal server error'}), 500
 
 
+@app.after_request
+def _no_store_html(response):
+    """Never let a browser cache the page shell.
+
+    The shell carries the versioned asset URLs, so caching it defeats the
+    cache-busting entirely: the browser reuses yesterday's HTML, requests
+    yesterday's `app.js?v=...`, and the operator sees a dashboard that has not
+    changed no matter how hard they reload. Flask sent NO cache headers for
+    the page, which leaves the browser free to cache heuristically — Safari
+    does.
+
+    Static assets keep their own caching; they are safe to cache precisely
+    because their URL changes when the file does.
+    """
+    if response.mimetype == 'text/html':
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
+
+
+@app.template_global()
+def asset_url(filename):
+    """Static asset URL with a cache-buster derived from the file's mtime.
+
+    The version used to be a hand-edited literal (`?v=20260808b`). It was
+    changed when somebody remembered, which meant every edit after that point
+    shipped under a URL browsers had already cached — the operator reloaded a
+    rebuilt dashboard and got the previous one, with no way to tell. An mtime
+    stamp cannot be forgotten.
+
+    Falls back to no version if the file is missing rather than raising: a
+    templating error would take the whole page down over a cosmetic concern.
+    """
+    path = os.path.join(app.static_folder, filename)
+    try:
+        stamp = int(os.path.getmtime(path))
+    except OSError:
+        return url_for('static', filename=filename)
+    return f"{url_for('static', filename=filename)}?v={stamp}"
+
+
 @app.route('/api/log', methods=['POST'])
 def api_client_log():
     """Accept log events from the browser client."""
@@ -151,7 +193,10 @@ def api_client_log():
 
 
 # Import device manager
-from device_manager import DeviceManager, DEFAULT_POLL_INTERVAL
+from device_manager import (
+    DeviceManager, DEFAULT_POLL_INTERVAL, FULL_SWEEP_MIN_INTERVAL,
+    wall_topology,
+)
 
 # Demo mode flag — set via --demo CLI arg or /api/demo endpoint
 DEMO_MODE = '--demo' in sys.argv
@@ -169,12 +214,44 @@ manager = DeviceManager(poll_interval=DEFAULT_POLL_INTERVAL)
 
 # ── Settings ──────────────────────────────────────────────
 
+# The low-voltage floor, in volts.
+#
+# This was 4.7, and 4.7 flags every healthy card on this hardware. The
+# receiving cards on the operator's wall report 4.10–4.40 V on the centi
+# firmware (h_series_json.decode_volt_centi, calibrated against a 1374-card
+# capture), and NovaStar's own H-series SNMP spec gives 4.6 V as its worked
+# example of a normal reading. A threshold above the entire normal range is
+# not a threshold; it is a guarantee of a false alarm per card per cycle, and
+# the alert history in src/error_log.json is exactly that — "Voltage 4.19V
+# below minimum threshold of 4.7V" across 15 cards on 3 chains.
+#
+# 3.8 V sits ~0.3 V (7%) below the bottom of the observed healthy band, which
+# is a real sag rather than normal spread. The older byte-schema fleet reads
+# the same band once its voltage byte is decoded the way NovaStar documents it
+# — lower 7 bits, units of 0.1 V, §4.3.4 / §5.4.2 — putting the 1374-card
+# capture's raw 165–173 at 3.7–4.5 V rather than the 4.95–5.19 V this comment
+# used to claim. That higher figure came from `raw * 0.03`, a formula this
+# project invented while trying to explain away exactly the false alarms the
+# 4.7 V floor was producing; the two schemas agree at ~4.2 V once the byte is
+# masked. Note the bottom of that byte-schema band (3.7 V) is just under this
+# floor, so a card down there will alert — see the note in
+# h_series_json.decode_voltage_byte.
+#
+# Anything under VOLTAGE_DEAD_V (0.5 V) is escalated to CRITICAL separately, so
+# this floor's whole job is to catch the middle case: a rail on its way down
+# but not yet gone.
+DEFAULT_VOLTAGE_MIN = 3.8
+
+# The old default, still sitting in every install's novastar_settings.json.
+# See _migrate_settings().
+LEGACY_VOLTAGE_MIN = 4.7
+
 DEFAULT_SETTINGS = {
     "devices": [],
     "poll_interval": DEFAULT_POLL_INTERVAL,
     "temp_warning": 60.0,
     "temp_critical": 75.0,
-    "voltage_min": 4.7,
+    "voltage_min": DEFAULT_VOLTAGE_MIN,
 }
 
 # Settings are read on every device update (i.e. once per card-poll cycle per
@@ -210,6 +287,32 @@ def _atomic_write_json(path, data):
         raise
 
 
+def _migrate_settings(settings):
+    """Correct persisted values that a changed default cannot reach.
+
+    A default only applies to a key the settings file does not have, and every
+    existing install wrote `voltage_min: 4.7` to disk the first time anything
+    was saved. Lowering DEFAULT_SETTINGS therefore fixes nobody who is already
+    running the app — including the operator whose wall prompted the fix.
+
+    Only the exact old default is rewritten. A 4.7 in a settings file cannot
+    be told apart from an operator who typed 4.7 on purpose, but on this
+    hardware 4.7 alarms on every healthy card either way, so leaving it is not
+    the conservative option — it is the one that keeps a broken alarm broken.
+    Any other value is an operator's choice and is left alone. In place, in
+    memory: this does not write to disk, so an install that is deliberately
+    running an old threshold gets it back by editing the file, not by hunting
+    for whatever rewrote it.
+    """
+    if settings.get('voltage_min') == LEGACY_VOLTAGE_MIN:
+        settings['voltage_min'] = DEFAULT_VOLTAGE_MIN
+        logger.warning(
+            'voltage_min was the old %.1f V default, which flags every '
+            'healthy card (they run 4.1-4.4 V) — using %.1f V instead',
+            LEGACY_VOLTAGE_MIN, DEFAULT_VOLTAGE_MIN)
+    return settings
+
+
 def _read_settings_file():
     """Read settings from disk, merged over the defaults.
 
@@ -220,7 +323,8 @@ def _read_settings_file():
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r') as f:
-                return {**copy.deepcopy(DEFAULT_SETTINGS), **json.load(f)}
+                return _migrate_settings(
+                    {**copy.deepcopy(DEFAULT_SETTINGS), **json.load(f)})
     except Exception:
         logger.exception('Failed to read settings from %s — using defaults',
                          SETTINGS_FILE)
@@ -386,12 +490,21 @@ def _card_breaches(cards, settings):
     Every comparison is guarded with `is not None`, never truthiness: 0.0 V
     (dead power supply) and 0.0 °C are falsy, and they are precisely the
     readings that must page someone.
+
+    That cuts both ways, which is why a card that is not reporting is dropped
+    before any comparison happens. On the H-series centi firmware a card the
+    controller cannot reach still ANSWERS R0155 — with `workStatus: 1` and
+    temp/volt/brightness all 0. Those zeros are placeholders, and a wall where
+    hundreds of cards are absent would otherwise raise hundreds of CRITICAL
+    "supply appears dead" alerts on first contact. `h_series_json` already
+    strips such a card's readings to None and marks it offline; both flags are
+    re-checked here so no future producer can slip a placeholder through.
     """
     temp_warn, temp_crit, volt_min = _thresholds(settings)
     breaches = []
 
     for card in cards or []:
-        if card.get('online') is False:
+        if card.get('online') is False or card.get('reporting') is False:
             continue
         key, label, chain, chain_label, port = _card_identity(card)
         base = {'key': key, 'label': label, 'chain': chain,
@@ -439,7 +552,18 @@ def _card_breaches(cards, settings):
         #     The Wall View paints that amber "suspect", and this is a WARNING
         #     for the same reason — nobody should be paged at 3am for a
         #     dropped packet.
-        # Neither reported (both None, e.g. the binary path) → nothing to say.
+        # Neither reported (both None, e.g. the binary path, or a card that
+        # is not reporting) → nothing to say. That last case matters: a
+        # non-reporting card sends `power0Status: 0, power1Status: 0`, and
+        # reading that as "both supplies healthy" is the same placeholder trap
+        # as reading its 0 V as a dead rail, just inverted. The parser hands
+        # such a card None/None precisely so it lands here.
+        #
+        # The 0 = OK polarity itself is INFERRED from the live wall (present
+        # cards were mostly 0,0), not documented — and one card that was
+        # plainly working reported 1,1, so a flagged supply is a prompt to go
+        # look, not proof of a failure.
+        #
         # These are booleans, not readings, so `value` stays None; `_worst`
         # handles a group with nothing rankable in it.
         primary_ok = card.get('primary_power_ok')
@@ -483,6 +607,146 @@ def _card_breaches(cards, settings):
     return breaches
 
 
+def _snmp_breaches(snmp):
+    """Evaluate the SNMP health block, in the same shape as card breaches.
+
+    Routine per-card polling is gone (it was one of the two behaviours behind
+    the outage), so the signals that arrive on every cycle are now the ones
+    SNMP can read without claiming the controller role: chassis fans, chassis
+    power supplies, the device's own temperature verdict, and the output
+    card's slot status. Output port link state used to be on that list and no
+    longer is — see the note where the alert was. They go through `_emit_card_alerts`
+    with the card breaches rather than down a path of their own, so one
+    physical fault still produces one alert and the dedupe, the tiering and
+    the per-cycle cap all apply to them too.
+
+    NOT EVALUATED, EVER: fan `speed_raw` and PSU `voltage_raw`. Neither is
+    implemented over SNMP — NovaStar R&D, by email: "The device's fan speed and
+    power supply voltage are not currently provided by the SNMP protocol. If
+    you require this data, it needs to be customized." They read 0 on every fan
+    and every supply because nothing is behind them, so there is no decode to
+    find and no firmware to wait for — see the note in
+    snmp_client.parse_fans. This codebase has twice shipped an alarm that fired
+    on healthy hardware because the number behind it was never pinned down: the
+    workStatus placeholder zeros, and the 4.7 V voltage floor set above the
+    band these cards actually report. (This note used to name "the masked
+    voltage formula" as the second case. It was not a case at all — the masked
+    form is the vendor-documented one, per NovaStar's H Series control protocol
+    §4.3.4 / §5.4.2; the alarms came from the threshold.) Only `status` / `ok`
+    fields decide anything here.
+
+    Takes no thresholds: every signal below is a boolean the device itself
+    reports, not a reading to compare against a number.
+    """
+    breaches = []
+    # `available` is false when this cycle's SNMP read produced nothing. The
+    # readings left in the block are then the last good ones, and alerting off
+    # stale values would report a fault that may have been fixed — or, worse,
+    # keep reporting one after the device stopped answering at all.
+    if not isinstance(snmp, dict) or not snmp.get('available'):
+        return breaches
+
+    chassis = {'chain': 'chassis', 'chain_label': 'the controller chassis',
+               'port': None}
+
+    # The device's own verdict on its temperature. It is a status field, not a
+    # reading, so the configured temp_warning / temp_critical thresholds have
+    # nothing to compare against and are not consulted.
+    if snmp.get('temperature_ok') is False:
+        breaches.append({
+            **chassis, 'key': 'chassis-temp', 'label': 'Controller chassis',
+            'unit': 'sensors', 'metric': 'Chassis temperature',
+            'severity': 'CRITICAL', 'value': None, 'worst_is_high': True,
+            'text': f'controller reports a temperature fault '
+                    f'(status {snmp.get("temperature_status")}) — check the '
+                    f'chassis airflow before the splicer throttles'})
+
+    # Fans. One dead fan on a ten-fan chassis is a hardware fault that leads
+    # to a thermal problem over minutes, not a dark wall right now — WARNING,
+    # with the chassis temperature above as the CRITICAL that follows if it
+    # actually gets hot. Several failing at once collapses to one chain-level
+    # alert, which is right: that is a fan tray, not ten coincidences.
+    for fan in snmp.get('fans') or []:
+        if fan.get('ok') is not False:
+            continue
+        fan_id = fan.get('fan_id')
+        breaches.append({
+            **chassis, 'key': f'chassis-fan{fan_id}',
+            'label': 'Fan' if fan_id is None else f'Fan {fan_id}',
+            'unit': 'fans', 'metric': 'Chassis fan', 'severity': 'WARNING',
+            'value': None, 'worst_is_high': True,
+            'text': f'reported failed by the controller '
+                    f'(status {fan.get("status")}) — fan speed is not reported '
+                    f'over SNMP at all, so it says nothing either way'})
+
+    # Power supplies, judged exactly like the per-card ones: a supply that has
+    # dropped off a redundant pair means the splicer is still up but now
+    # running unprotected, and the next failure takes the whole wall dark.
+    #
+    # `ok` is the `iSignal` flag, and only that. NovaStar R&D, by email, on
+    # `.1.17`: "Regarding the device power status, please use the iSignal
+    # field. Meaning: Power status (0: not connected to power, 1: connected to
+    # power)." So False here is the device's own documented claim that a supply
+    # is not connected to power — a real state, worth a CRITICAL mid-show.
+    #
+    # This loop was unreachable until that answer arrived: PSU `ok` was derived
+    # from the `status` key and never came back False, because nobody could say
+    # what `status` meant. It still cannot — R&D did not document it — so
+    # `status` is quoted in the text as raw evidence and is not what fired the
+    # alert. Do not reinstate a rule that reads it.
+    # Only supplies this process WATCHED drop from connected to not connected.
+    # `ok is False` on its own is not alertable: an empty PSU bay reports
+    # exactly the same iSignal 0 as a dead supply, so alerting on the state
+    # would raise a CRITICAL every cycle for the life of the show about a bay
+    # that never had a supply in it. See `_psu_transitions` in device_manager.
+    dropped = set(snmp.get('dropped_psus') or [])
+    for psu in snmp.get('psus') or []:
+        if psu.get('power_id') not in dropped:
+            continue
+        psu_id = psu.get('power_id')
+        breaches.append({
+            **chassis, 'key': f'chassis-psu{psu_id}',
+            'label': 'PSU' if psu_id is None else f'PSU {psu_id}',
+            'unit': 'supplies', 'metric': 'Chassis power supply',
+            'severity': 'CRITICAL', 'value': None, 'worst_is_high': True,
+            'text': f'controller reports this supply as not connected to power '
+                    f'(iSignal {psu.get("i_signal")}, raw status '
+                    f'{psu.get("status")}) — the splicer is running on its '
+                    f'remaining supplies'})
+
+    output = snmp.get('output') or {}
+
+    # `slot_ok` is False only for the card-slot status's documented ABNORMAL
+    # value, which is 0 — the inverse of every `Normal: 0` field above it in
+    # this function. device_manager._snmp_slot_ok owns that polarity and also
+    # withholds the verdict entirely when the `.30` subtree is answering with
+    # stubs, so False here is a real claim rather than an artefact.
+    if output.get('slot_ok') is False:
+        breaches.append({
+            **chassis, 'key': 'output-card', 'label': 'Output card',
+            'unit': 'cards', 'metric': 'Output card', 'severity': 'CRITICAL',
+            'value': None, 'worst_is_high': True,
+            'text': f'reports a fault (slot status '
+                    f'{output.get("slot_status")}; the healthy value is 1)'})
+
+    # There is deliberately NO output-port link alert here. A CRITICAL
+    # "Output port N: link lost" used to be raised from `output['ports_down']`;
+    # both the key and the alert are gone. The `.30.5.x` OIDs it rested on are
+    # a FIELD table for one port (link status, backup working, backup link) and
+    # not a per-port link array, so `{1: 0, 3: 0, 4: 0}` from our H15 was never
+    # "three ports down" — it was one primary link plus an idle backup, which
+    # is what a healthy wall reports. device_manager._apply_snmp_health carries
+    # the full account. The raw fields are still published under
+    # `output['port']` for display; nothing may derive a verdict from them,
+    # because which port they describe is selected by a `.30.4` SET the
+    # read-only client never issues.
+    #
+    # Output-chain faults are covered by the per-card R0155 path, which knows
+    # which chain it is talking about — see `chain_breaks`.
+
+    return breaches
+
+
 def _worst(items):
     """Pick the most severe breach in a group (hottest / lowest voltage).
 
@@ -506,6 +770,11 @@ def _emit_card_alerts(device_name, breaches):
       · >= DEVICE_ROLLUP_CHAIN_THRESHOLD chains affected → one device alert
       · >= CHAIN_ALERT_THRESHOLD cards on one chain      → one chain alert
       · otherwise                                        → one alert per card
+
+    Also used for the SNMP chassis breaches, which are counted in fans and
+    supplies rather than cards — hence `unit`, read per group because a group
+    is one (severity, metric) pair and so is all of one kind. It defaults to
+    'cards' so every card breach reads exactly as it did before.
     """
     emitted = 0
     suppressed = 0
@@ -515,6 +784,7 @@ def _emit_card_alerts(device_name, breaches):
         by_kind.setdefault((b['severity'], b['metric']), []).append(b)
 
     for (severity, metric), group in sorted(by_kind.items()):
+        unit = group[0].get('unit') or 'cards'
         chains = {}
         for b in group:
             chains.setdefault(b['chain'], []).append(b)
@@ -524,10 +794,10 @@ def _emit_card_alerts(device_name, breaches):
             worst = _worst(group)
             if _alert_due(f'{device_name}|wall|{metric}|{severity}'):
                 add_error(severity, device_name,
-                          f'{metric} alert on {len(group)} cards '
+                          f'{metric} alert on {len(group)} {unit} '
                           f'across {len(chains)} chains — worst {worst["label"]}: '
                           f'{worst["text"]}',
-                          cabinet=f'{len(group)} cards / {len(chains)} chains',
+                          cabinet=f'{len(group)} {unit} / {len(chains)} chains',
                           value=worst['value'])
                 emitted += 1
             continue
@@ -539,10 +809,10 @@ def _emit_card_alerts(device_name, breaches):
             if len(items) >= CHAIN_ALERT_THRESHOLD:
                 if _alert_due(f'{device_name}|chain:{chain_key}|{metric}|{severity}'):
                     add_error(severity, device_name,
-                              f'{metric} alert on {len(items)} cards '
+                              f'{metric} alert on {len(items)} {unit} '
                               f'on {worst["chain_label"]} — worst '
                               f'{worst["label"]}: {worst["text"]}',
-                              cabinet=f'{len(items)} cards on {worst["chain_label"]}',
+                              cabinet=f'{len(items)} {unit} on {worst["chain_label"]}',
                               port=worst['port'], value=worst['value'])
                     emitted += 1
                 continue
@@ -573,6 +843,12 @@ def _emit_device_rollup(device_name, live_monitoring, settings):
     device_manager already computes `temperature_max_c` and nothing read it.
     `voltage_min_v` is used if the manager provides it; the mean voltage is
     useless for detecting a single failed supply, so it is never used here.
+
+    Both figures come from `_update_aggregates`, which only ever sees cards
+    that are actually reporting — a non-reporting card's placeholder 0 can
+    reach neither the max nor the min, which is what keeps this rollup from
+    firing a wall-wide "supply appears dead" on a wall that is merely partly
+    unreachable.
     """
     temp_warn, temp_crit, volt_min = _thresholds(settings)
     lm = live_monitoring or {}
@@ -603,12 +879,80 @@ def _emit_device_rollup(device_name, live_monitoring, settings):
                       value=volt_low)
 
 
+def _chain_break_breaches(breaks):
+    """Turn detected data breaks into breaches, in the shared breach shape.
+
+    This is the highest-confidence fault the app can report: the cards were
+    enumerated as present, and a contiguous run of them from a known point to
+    the end of the chain has either stopped answering or started reporting bit
+    errors. Until now it rendered only on the Wall View, so it was seen only
+    if somebody happened to have that tab open.
+
+    Deliberately NOT gated on card-reading freshness: a break is derived from
+    the bit-error read that produced it, and that read is the evidence.
+
+    One breach per chain, so the existing wall/chain/card tiering collapses a
+    wall-wide failure into a single alert rather than one per broken run.
+    """
+    out = []
+    for b in (breaks or []):
+        if not isinstance(b, dict):
+            continue
+        card = b.get('card_number')
+        port = b.get('port')
+        panel = b.get('break_panel')
+        affected = b.get('affected')
+        port_label = port + 1 if isinstance(port, int) else port
+        where = ('at or before the first panel' if b.get('at_head')
+                 else f'at panel {panel}')
+        if b.get('signature') == 'no_answer':
+            detail = (f'{affected} panels stopped answering — the enumeration '
+                      f'recorded them as present')
+        else:
+            detail = (f'{affected} panels are reporting bit errors, '
+                      f'everything before them is clean')
+        chain_label = f'card {card} port {port_label}'
+        out.append({
+            'key': f'break:{card}:{port}',
+            'label': f'Card {card} · Port {port_label}',
+            'chain': f'{card}:{port}',
+            'chain_label': chain_label,
+            'port': port,
+            'metric': 'Data break',
+            'severity': 'CRITICAL',
+            'value': affected,
+            'worst_is_high': True,
+            'unit': 'chains',
+            'text': (f'Data break {where} on {chain_label}: {detail}. '
+                     f'Panels after a break may still be lit by a backup '
+                     f'sender card, so the wall can look fine.'),
+        })
+    return out
+
+
 def evaluate_alerts(device_id, state):
-    """Run the full alert evaluation for one polled device state."""
+    """Run the full alert evaluation for one polled device state.
+
+    Card breaches and SNMP chassis breaches are emitted in ONE call, not two,
+    so MAX_ALERTS_PER_CYCLE stays an honest per-cycle cap rather than a cap
+    per source. Per-card readings only exist here when somebody has asked for
+    them on demand; SNMP is what arrives every cycle.
+    """
     settings = load_settings()
     device_name = state.get('name', device_id)
-    _emit_card_alerts(device_name,
-                      _card_breaches(state.get('receiving_cards'), settings))
+
+    # Per-card readings are taken on demand, so `receiving_cards` can hold
+    # values from hours ago. Alerting on them every cycle meant a card that
+    # read 76 C during a sweep at 14:00 raised a fresh CRITICAL every minute
+    # for the rest of the day — after it had been fixed, powered down or
+    # unplugged, with nothing to say the reading was old. An alert nobody can
+    # act on is worse than no alert: it trains an operator to ignore the log.
+    breaches = []
+    if state.get('cards_fresh'):
+        breaches = _card_breaches(state.get('receiving_cards'), settings)
+    breaches += _snmp_breaches(state.get('snmp'))
+    breaches += _chain_break_breaches(state.get('chain_breaks'))
+    _emit_card_alerts(device_name, breaches)
     _emit_device_rollup(device_name, state.get('live_monitoring'), settings)
 
 
@@ -739,6 +1083,411 @@ def api_device_state(device_id):
     if not state:
         return jsonify({"error": "Device not found"}), 404
     return jsonify(state)
+
+
+# ── Emergency stop & on-demand card reads ─────────────────
+#
+# `/api/halt` is the control the operator did not have during the outage. The
+# only way to stop this app touching the wall mid-show was to kill it, which
+# also took away the dashboard, the alert history and the log. The flag it
+# flips lives in device_manager and is process-wide, so it covers every
+# transport — JSON UDP, the binary path, and SNMP.
+#
+# The reason string is kept here rather than in device_manager because it is
+# purely an operator-facing note ("show in progress"); the stop itself needs
+# nothing but a boolean, and nothing about honouring it may depend on this.
+
+_halt_reason = None
+_halt_reason_lock = threading.Lock()
+MAX_HALT_REASON = 200
+
+
+def _halt_payload():
+    """The `/api/halt` body. `halted` always comes from device_manager.
+
+    The authority is the module-level flag, never a copy kept here: a halt
+    engaged from the console or from a future scheduler must still read back
+    as halted through the API.
+    """
+    with _halt_reason_lock:
+        return {'halted': manager.is_halted(), 'reason': _halt_reason}
+
+
+@app.route('/api/halt', methods=['GET'])
+def api_halt_status():
+    return jsonify(_halt_payload())
+
+
+@app.route('/api/halt', methods=['POST'])
+def api_halt_set():
+    """Engage or release the global stop.
+
+    Deliberately does nothing except set a flag (and record a note), so it
+    completes while a poll is in flight: reads already on the wire finish on
+    their own timeouts rather than being aborted, because yanking a socket out
+    from under a poll thread produces a hang, not a stop.
+    """
+    global _halt_reason
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+
+    halted = data.get('halted')
+    # Strictly a boolean: an emergency stop is not somewhere to be generous
+    # about what "1" or "false" might have meant.
+    if not isinstance(halted, bool):
+        return jsonify({"error": "halted must be true or false"}), 400
+
+    reason = data.get('reason')
+    reason = str(reason).strip()[:MAX_HALT_REASON] if reason is not None else ''
+
+    if halted:
+        manager.halt(reason or None)
+        with _halt_reason_lock:
+            _halt_reason = reason or None
+    else:
+        manager.resume()
+        with _halt_reason_lock:
+            _halt_reason = None
+
+    payload = _halt_payload()
+    log_event('device_contact_halted' if halted else 'device_contact_resumed',
+              {'reason': payload['reason']})
+    socketio.emit('halt_changed', payload)
+    return jsonify(payload)
+
+
+@app.route('/api/devices/<device_id>/refresh_cards', methods=['POST'])
+def api_refresh_cards(device_id):
+    """Read receiving cards on demand — one chain, or the whole inventory.
+
+    Per-card reads are no longer routine (the ~1374-card sweep every cycle is
+    one of the two behaviours implicated in the outage), so this is the only
+    way per-card readings are ever taken. Empty body = every chain, which is
+    rate-limited in device_manager; `{"slot": N, "port": N}` = one chain,
+    which is tens of cards and is not.
+
+    Three outcomes, and the caller has to be able to tell them apart:
+      · "ok"      the read ran; `cards` is how many came back
+      · "refused" the rate limiter declined it — distinct from a read that
+                  ran and found nothing, which is "ok" with cards 0
+      · "halted"  the global stop is engaged
+    """
+    dev = manager.devices.get(device_id)
+    if dev is None:
+        return jsonify({"error": "Device not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+
+    slot, port = data.get('slot'), data.get('port')
+    one_chain = slot is not None or port is not None
+    if one_chain and (slot is None or port is None):
+        return jsonify({"error": "slot and port must be given together"}), 400
+    if one_chain:
+        try:
+            slot, port = int(slot), int(port)
+        except (TypeError, ValueError):
+            return jsonify({"error": "slot and port must be integers"}), 400
+
+    refresh_chain = getattr(dev, 'refresh_chain', None)
+    refresh_all = getattr(dev, 'refresh_all_cards', None)
+    if not callable(refresh_chain) or not callable(refresh_all):
+        return jsonify({"error": "Device has no per-card reads"}), 400
+
+    # Checked before dispatching, because refresh_all_cards() returns None for
+    # both "halted" and "rate-limited" and the frontend has to distinguish
+    # them: one is the operator's own doing, the other is a wait.
+    if manager.is_halted():
+        return jsonify({"status": "halted", "cards": 0,
+                        "reason": _halt_payload()['reason']
+                        or 'device contact is halted'})
+
+    if one_chain:
+        cards = refresh_chain(slot, port)
+    else:
+        cards = refresh_all()
+
+    if cards is None:
+        # A halt engaged between the check above and the call lands here too,
+        # so re-read the flag rather than reporting the operator's own stop as
+        # a rate limit.
+        if manager.is_halted():
+            return jsonify({"status": "halted", "cards": 0,
+                            "reason": _halt_payload()['reason']
+                            or 'device contact is halted'})
+        return jsonify({
+            "status": "refused", "cards": 0,
+            "reason": f'a full sweep runs at most once every '
+                      f'{int(FULL_SWEEP_MIN_INTERVAL)}s — it is the traffic '
+                      f'pattern that cost the operator control of the wall'})
+
+    log_event('cards_refreshed', {'device_id': device_id, 'slot': slot,
+                                  'port': port, 'cards': len(cards)})
+    # Push the fresh readings out the same way a poll cycle would, so the
+    # dashboard updates and the new values are alert-evaluated. Cards read on
+    # demand are the only per-card data there is now; they must not be
+    # collected and then not looked at.
+    state = manager.get_state(device_id)
+    if state is not None:
+        on_device_update(device_id, state)
+    return jsonify({"status": "ok", "cards": len(cards), "reason": None})
+
+
+def _read_progress(device_id):
+    """Emit per-card read progress to the dashboard as it happens.
+
+    A whole-wall pass is 286 sequential reads with a 45 s pause partway. With
+    no progress it is indistinguishable from a hang, and an operator who kills
+    it mid-show loses the pass AND has spent the controller's request budget
+    for nothing.
+    """
+    def emit(info):
+        socketio.emit('read_progress', dict(info, device_id=device_id))
+        # On a flush the device has just published a partial result. Push it
+        # out the same way a poll cycle would, so the wall fills in as the
+        # read proceeds instead of staying blank for minutes and then jumping.
+        # Alerts are evaluated on it too — a break found at card 40 of 286 is
+        # worth knowing about before the remaining 246 are read.
+        if info.get('phase') == 'flush':
+            state = manager.get_state(device_id)
+            if state is not None:
+                on_device_update(device_id, state)
+    return emit
+
+
+@app.route('/api/devices/<device_id>/live_readings', methods=['POST'])
+def api_refresh_live_readings(device_id):
+    """Read temperature/voltage/link for every card, over the binary path.
+
+    The whole-wall read that actually covers the whole wall. R0155 answers
+    about 150 cards before the controller stops talking, so the JSON route
+    left ~87% of a 286-panel wall with no readings at all and the dashboard
+    averaging the rest as if it were the wall.
+
+    Read-only.
+    """
+    dev = manager.devices.get(device_id)
+    if dev is None:
+        return jsonify({"error": "Device not found"}), 404
+    read = getattr(dev, 'refresh_live_readings', None)
+    if not callable(read):
+        return jsonify({"error": "Device has no binary per-card reads"}), 400
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    slot, port = data.get('slot'), data.get('port')
+    one_chain = slot is not None or port is not None
+    if one_chain and (slot is None or port is None):
+        return jsonify({"error": "slot and port must be given together"}), 400
+
+    cards = None
+    if one_chain:
+        try:
+            slot, port = int(slot), int(port)
+        except (TypeError, ValueError):
+            return jsonify({"error": "slot and port must be integers"}), 400
+        known = getattr(dev, 'known_cards', None)
+        inventory = known() if callable(known) else []
+        cards = [c for c in inventory
+                 if c.get('slot') == slot and c.get('port') == port]
+
+    if manager.is_halted():
+        return jsonify({"status": "halted", "cards": 0,
+                        "reason": _halt_payload()['reason']
+                        or 'device contact is halted'})
+
+    results = read(cards, progress=_read_progress(device_id))
+    if results == "busy":
+        # Two concurrent passes would interleave on one TCP connection, spend
+        # the controller's request budget twice as fast, and report progress
+        # over each other — which is what made the bar jump around.
+        return jsonify({"status": "busy", "cards": 0,
+                        "reason": 'a per-card read is already running on this '
+                                  'device — wait for it to finish'}), 409
+    if results is None:
+        return jsonify({"status": "halted", "cards": 0,
+                        "reason": _halt_payload()['reason']
+                        or 'device contact is halted'})
+
+    answered = sum(1 for r in results if r.get('present'))
+    log_event('live_readings', {'device_id': device_id, 'slot': slot,
+                                'port': port, 'cards': answered})
+    state = manager.get_state(device_id)
+    if state is not None:
+        on_device_update(device_id, state)
+    return jsonify({"status": "ok", "cards": answered, "reason": None})
+
+
+@app.route('/api/devices/<device_id>/bit_errors', methods=['POST'])
+def api_refresh_bit_errors(device_id):
+    """Read per-card bit-error counters on demand.
+
+    Binary-only — R0155 carries no bit errors — so this is the one reading
+    that cannot come from the JSON path. Same shape as `/refresh_cards`:
+    empty body reads the whole known inventory (capped), `{"slot": N,
+    "port": N}` reads one chain.
+
+    Read-only. Nothing here writes to the controller.
+    """
+    dev = manager.devices.get(device_id)
+    if dev is None:
+        return jsonify({"error": "Device not found"}), 404
+
+    read = getattr(dev, 'refresh_bit_errors', None)
+    if not callable(read):
+        return jsonify({"error": "Device has no bit-error reads"}), 400
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+
+    slot, port = data.get('slot'), data.get('port')
+    one_chain = slot is not None or port is not None
+    if one_chain and (slot is None or port is None):
+        return jsonify({"error": "slot and port must be given together"}), 400
+
+    cards = None
+    if one_chain:
+        try:
+            slot, port = int(slot), int(port)
+        except (TypeError, ValueError):
+            return jsonify({"error": "slot and port must be integers"}), 400
+        known = getattr(dev, 'known_cards', None)
+        inventory = known() if callable(known) else []
+        cards = [c for c in inventory
+                 if c.get('slot') == slot and c.get('port') == port]
+
+    if manager.is_halted():
+        return jsonify({"status": "halted", "cards": 0,
+                        "reason": _halt_payload()['reason']
+                        or 'device contact is halted'})
+
+    results = read(cards, progress=_read_progress(device_id))
+    if results == "busy":
+        # Two concurrent passes would interleave on one TCP connection, spend
+        # the controller's request budget twice as fast, and report progress
+        # over each other — which is what made the bar jump around.
+        return jsonify({"status": "busy", "cards": 0,
+                        "reason": 'a per-card read is already running on this '
+                                  'device — wait for it to finish'}), 409
+    if results is None:
+        return jsonify({"status": "halted", "cards": 0,
+                        "reason": _halt_payload()['reason']
+                        or 'device contact is halted'})
+
+    log_event('bit_errors_read', {'device_id': device_id, 'slot': slot,
+                                  'port': port, 'cards': len(results)})
+    state = manager.get_state(device_id)
+    if state is not None:
+        on_device_update(device_id, state)
+    return jsonify({"status": "ok", "cards": len(results), "reason": None})
+
+
+@app.route('/api/devices/<device_id>/bit_errors/baseline', methods=['POST'])
+def api_bit_error_baseline(device_id):
+    """Zero the displayed bit-error counters, or restore the raw ones.
+
+    `{"zero": true}`  — record the current counters as the new zero point.
+    `{"zero": false}` — forget it and show the controller's own cumulative
+                        totals again.
+
+    This does NOT write to the controller. The device-side counter is
+    cumulative and the command NovaLCT uses to reset it has not been captured,
+    so "clear" here means "start counting from now" in this app only. Say so
+    in the UI: an operator who believes the hardware counter was reset, when
+    it was not, will misread the next engineer's readings.
+    """
+    dev = manager.devices.get(device_id)
+    if dev is None:
+        return jsonify({"error": "Device not found"}), 404
+
+    setter = getattr(dev, 'set_bit_error_baseline', None)
+    clearer = getattr(dev, 'clear_bit_error_baseline', None)
+    if not callable(setter) or not callable(clearer):
+        return jsonify({"error": "Device has no bit-error baseline"}), 400
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    zero = data.get('zero', True)
+    if not isinstance(zero, bool):
+        return jsonify({"error": "zero must be a boolean"}), 400
+
+    if zero:
+        count = setter()
+    else:
+        clearer()
+        count = 0
+
+    log_event('bit_error_baseline', {'device_id': device_id, 'zero': zero,
+                                     'cards': count})
+    state = manager.get_state(device_id)
+    if state is not None:
+        on_device_update(device_id, state)
+    return jsonify({"status": "ok", "zero": zero, "cards": count,
+                    "device_counter_reset": False})
+
+
+@app.route('/api/devices/<device_id>/bit_errors/clear', methods=['POST'])
+def api_clear_device_bit_errors(device_id):
+    """Clear the controller's own bit-error counters. THIS WRITES TO THE DEVICE.
+
+    The only write this application makes. It sends the frame NovaLCT sends
+    when you click "clear", reproduced byte-for-byte from a capture, and it is
+    broadcast — every card on every chain of every sender card.
+
+    Requires `{"confirm": true}` in the body. Not because a typo is likely,
+    but because this is the one endpoint whose effect cannot be undone: the
+    counter is cumulative and clearing it discards a number that may be the
+    only evidence of an intermittent link, for whoever looks next — not just
+    for this dashboard.
+
+    `/bit_errors/baseline` is the non-destructive alternative: it zeroes the
+    display here and leaves the hardware counter intact.
+    """
+    dev = manager.devices.get(device_id)
+    if dev is None:
+        return jsonify({"error": "Device not found"}), 404
+
+    clear = getattr(dev, 'clear_device_bit_errors', None)
+    if not callable(clear):
+        return jsonify({"error": "Device cannot clear bit errors"}), 400
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    if data.get('confirm') is not True:
+        return jsonify({
+            "status": "refused",
+            "reason": 'clearing the controller\'s bit-error counters is a '
+                      'device write and cannot be undone — send '
+                      '{"confirm": true} to proceed, or use '
+                      '/bit_errors/baseline to zero the display only',
+        }), 400
+
+    if manager.is_halted():
+        return jsonify({"status": "halted",
+                        "reason": _halt_payload()['reason']
+                        or 'device contact is halted'})
+
+    if not clear():
+        if manager.is_halted():
+            return jsonify({"status": "halted",
+                            "reason": _halt_payload()['reason']
+                            or 'device contact is halted'})
+        return jsonify({"status": "failed",
+                        "reason": 'the controller did not accept the write'})
+
+    log_event('bit_errors_cleared', {'device_id': device_id,
+                                     'device_write': True})
+    state = manager.get_state(device_id)
+    if state is not None:
+        on_device_update(device_id, state)
+    return jsonify({"status": "ok", "device_counter_reset": True,
+                    "reason": None})
 
 
 @app.route('/api/settings', methods=['GET'])
@@ -934,19 +1683,198 @@ def load_wall_snapshot(path=None):
     return data, mtime_iso
 
 
+# How the enumeration snapshot is regenerated. Quoted to the operator
+# verbatim whenever the stored snapshot is stale or missing, because "run the
+# enumeration" is not an instruction anybody can act on. The flag is mandatory
+# by design — see the Safety section of enumerate_wall's module docstring.
+ENUMERATE_HINT = 'python3 src/enumerate_wall.py <controller-ip> --yes-contact-hardware'
+
+
+def _norm_name(value):
+    """Screen name normalised for comparison. None when there is no name."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text.upper() if text else None
+
+
+def _snapshot_identity(snapshot):
+    """The three facts about a snapshot that identify which wall it describes."""
+    snapshot = snapshot or {}
+    size = snapshot.get('screen_size')
+    canvas = None
+    if isinstance(size, dict):
+        w, h = size.get('width'), size.get('height')
+        if isinstance(w, int) and isinstance(h, int):
+            canvas = {'width': w, 'height': h}
+    slots = sorted({sc.get('slot') for sc in (snapshot.get('sender_cards') or [])
+                    if isinstance(sc, dict) and isinstance(sc.get('slot'), int)})
+    return {
+        'screen_name': snapshot.get('screen_name'),
+        'canvas': canvas,
+        'sender_slots': slots,
+    }
+
+
+def compare_snapshot_to_topology(snapshot, topology):
+    """Decide whether a stored snapshot describes the wall now configured.
+
+    Returns a verdict dict with a three-valued `status`:
+
+      no_snapshot  nothing on disk.
+      unverified   there is a snapshot but the device has not reported its
+                   topology, so nothing can be checked. Absence of live data
+                   is NOT evidence the snapshot is wrong, so it is still
+                   shown — labelled as unverified, never as live.
+      match        every check that could be evaluated agreed.
+      mismatch     at least one check disagreed. The snapshot describes a
+                   DIFFERENT wall and its cards must not be presented as the
+                   state of this one.
+
+    Three discriminators, in descending order of how obvious they are to an
+    operator: the screen name, the canvas size, and the set of sender slots.
+    Any one of them disagreeing is disqualifying — a wall rebuilt onto the
+    same screen name with different sender cards is still a different wall,
+    and the card inventory would be wrong in exactly the way that produced
+    this bug. Each check is skipped when either side is silent, so a snapshot
+    written before a field existed degrades to "unverified", not "stale".
+    """
+    if not snapshot:
+        return {'status': 'no_snapshot', 'checks': {}, 'reasons': [],
+                'snapshot': _snapshot_identity(None), 'live': None}
+
+    ident = _snapshot_identity(snapshot)
+    if not topology:
+        return {'status': 'unverified', 'checks': {}, 'snapshot': ident,
+                'live': None,
+                'reasons': ['The controller has not reported its screen layout, '
+                            'so the stored snapshot could not be checked against '
+                            'the wall that is currently configured.']}
+
+    live_ident = {
+        'screen_name': topology.get('screen_name'),
+        'canvas': topology.get('canvas'),
+        'sender_slots': topology.get('sender_slots') or [],
+    }
+
+    checks, reasons = {}, []
+
+    snap_name, live_name = _norm_name(ident['screen_name']), _norm_name(live_ident['screen_name'])
+    if snap_name and live_name:
+        checks['screen_name'] = 'match' if snap_name == live_name else 'mismatch'
+        if checks['screen_name'] == 'mismatch':
+            reasons.append(
+                f"The stored snapshot was enumerated on \"{ident['screen_name']}\", "
+                f"but the controller is currently configured as "
+                f"\"{live_ident['screen_name']}\".")
+    else:
+        checks['screen_name'] = 'unknown'
+
+    if ident['canvas'] and live_ident['canvas']:
+        same = (ident['canvas']['width'] == live_ident['canvas']['width']
+                and ident['canvas']['height'] == live_ident['canvas']['height'])
+        checks['canvas'] = 'match' if same else 'mismatch'
+        if not same:
+            reasons.append(
+                f"Canvas is {live_ident['canvas']['width']}x"
+                f"{live_ident['canvas']['height']} on the controller, but the "
+                f"snapshot describes {ident['canvas']['width']}x"
+                f"{ident['canvas']['height']}.")
+    else:
+        checks['canvas'] = 'unknown'
+
+    if ident['sender_slots'] and live_ident['sender_slots']:
+        # Subset, not equality. R0405 lists every sender card, including the
+        # backups — on the H15 that is 20, 22, 28 and 30, two primary and two
+        # backup. A backup answers nothing over R0155 and has no cards behind
+        # it until it takes over, so an enumeration can only ever record the
+        # slots it actually found cards on. Requiring equality rejected a
+        # snapshot taken minutes earlier from this very controller.
+        #
+        # The safety property survives: a wall rebuilt onto different sender
+        # cards has slots the current topology does not list, which still
+        # fails. What no longer fails is a correct snapshot that simply omits
+        # a slot with nothing on it.
+        extra = sorted(set(ident['sender_slots'])
+                       - set(live_ident['sender_slots']))
+        checks['sender_slots'] = 'mismatch' if extra else 'match'
+        if extra:
+            reasons.append(
+                'The snapshot has cards on sender slot(s) '
+                f"{', '.join(str(s) for s in extra)}, which the controller "
+                'does not report at all. It reports '
+                f"{', '.join(str(s) for s in sorted(live_ident['sender_slots']))}.")
+    else:
+        checks['sender_slots'] = 'unknown'
+
+    verdicts = set(checks.values())
+    if 'mismatch' in verdicts:
+        status = 'mismatch'
+    elif 'match' in verdicts:
+        status = 'match'
+    else:
+        # A snapshot nothing could be checked against. Same treatment as no
+        # live topology at all: shown, but never asserted to be this wall.
+        status = 'unverified'
+        reasons.append('None of the snapshot\'s identifying fields could be '
+                       'compared with what the controller reports.')
+
+    return {'status': status, 'checks': checks, 'reasons': reasons,
+            'snapshot': ident, 'live': live_ident}
+
+
+def panel_capacity(canvas, panel):
+    """Theoretical panel capacity of a canvas at a given panel pitch, or None.
+
+    This is a division, not a measurement: it says how many panels of this
+    pitch would TILE the canvas, and says nothing about how many are hung,
+    cabled or powered. Everything that renders it has to label it as capacity
+    — presenting it as "panels detected" would be the same class of lie this
+    endpoint exists to stop telling.
+    """
+    if not isinstance(canvas, dict) or not isinstance(panel, dict):
+        return None
+    cw, ch = canvas.get('width'), canvas.get('height')
+    pw, ph = panel.get('width'), panel.get('height')
+    for value in (cw, ch, pw, ph):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return None
+    return {'columns': cw // pw, 'rows': ch // ph,
+            'panels': (cw // pw) * (ch // ph),
+            'panel': {'width': pw, 'height': ph}}
+
+
+def _configured_panel_size():
+    """Panel pitch from the operator-authored wall config, or None."""
+    try:
+        panel = wc.load_config(APP_DIR, BASE_DIR).get('panel')
+    except Exception:
+        logger.exception('Could not read panel size from wall config')
+        return None
+    return panel if isinstance(panel, dict) else None
+
+
 @app.route('/api/wall_live', methods=['GET'])
 def api_wall_live():
     """Return the device-derived wall topology + per-card monitoring.
 
-    Reads the most recent enumeration snapshot (src/wall_live_snapshot.json),
-    plus current live state from device_manager. The snapshot is produced
-    by the R0155 enumeration script; the live state overlays current temps
-    if the polling thread has been updating cards.
+    Two sources, with a strict hierarchy between them:
 
-    The payload states its own freshness explicitly. A snapshot file existing
-    on disk says nothing about whether any hardware is currently connected —
-    rendering months-old temperatures as if they were live is the worst
-    failure mode this tool has.
+    * The CONTROLLER is the authority on what the wall is — screen name,
+      canvas, mosaic, outputs, sender slots. Re-derived from `screen_outputs`
+      (R0405) on every request, never defaulted from disk.
+    * The enumeration snapshot (`src/wall_live_snapshot.json`) may only supply
+      what the controller cannot report: the receiving-card inventory. And it
+      may only do so once it has been checked against the live topology — a
+      snapshot enumerated on a wall that has since been reconfigured describes
+      a different wall, and is withheld entirely rather than dimmed or
+      badged. See `compare_snapshot_to_topology`.
+
+    Panel count is therefore three-valued, and `panels` carries its own
+    provenance: a number only when a matching enumeration exists, otherwise
+    `known: false` with the reason. The controller reports geometry, not how
+    many receiving cards are attached, so "unknown" is the honest answer and
+    the geometric `capacity` alongside it is explicitly not a panel count.
     """
     snapshot, snapshot_mtime = load_wall_snapshot()
 
@@ -954,38 +1882,173 @@ def api_wall_live():
     h = next((d for d in devices if d.get('device_type') == 'h_series'
               and d.get('connected')), None)
 
-    if not snapshot and not h:
-        return jsonify({'available': False, 'live': False,
-                        'device_connected': False,
-                        'reason': 'no snapshot, no live device'}), 200
+    topology = wall_topology(h) if h else None
+    verdict = compare_snapshot_to_topology(snapshot, topology)
+    snapshot_usable = verdict['status'] in ('match', 'unverified')
+
+    if not topology and not snapshot_usable:
+        return jsonify({
+            'available': False, 'live': False, 'device_connected': bool(h),
+            'topology': None,
+            'snapshot_status': verdict,
+            'snapshot_mtime': snapshot_mtime,
+            'enumerate_hint': ENUMERATE_HINT,
+            'reason': ('stored snapshot is for a different wall'
+                       if verdict['status'] == 'mismatch'
+                       else 'no snapshot, no live device'),
+        }), 200
 
     cards = h.get('receiving_cards', []) if h else []
+    snapshot_cards = (snapshot or {}).get('cards') if snapshot_usable else None
+    snapshot_cards = snapshot_cards if isinstance(snapshot_cards, list) else None
+
+    # Where the cells on screen actually come from, stated once. `live` is a
+    # claim about the CARDS, not about the connection: a connected controller
+    # sitting in front of snapshot cards is not live data, and saying it is
+    # was the original bug.
+    if cards:
+        cards_source = 'device'
+    elif snapshot_cards:
+        cards_source = 'snapshot'
+    else:
+        cards_source = None
+
     payload = {
         'available': True,
-        # `live` means: a device is connected AND it has actually reported
-        # cards this session. Anything else is historical data.
-        'live': bool(h) and len(cards) > 0,
+        'live': cards_source == 'device',
         'device_connected': bool(h),
-        # When enumeration captured the snapshot. The writer is adding this
-        # field separately, so fall back to the file's mtime until it lands.
-        'captured_at': (snapshot or {}).get('captured_at'),
+        'topology': topology,
+        'topology_source': 'device' if topology else None,
+        'snapshot_status': verdict,
+        'enumerate_hint': ENUMERATE_HINT,
+        # When enumeration captured the snapshot. Older snapshots predate the
+        # field, so the file's mtime is the fallback upper bound.
+        'captured_at': (snapshot or {}).get('captured_at') if snapshot_usable else None,
         'snapshot_mtime': snapshot_mtime,
         'last_poll': h.get('last_poll') if h else None,
+        'cards_source': cards_source,
+        'panels': _panel_report(topology, verdict, snapshot_cards, cards),
     }
-    if snapshot:
+    if snapshot_usable and snapshot:
         payload['snapshot'] = snapshot
     if h:
         payload['device'] = {
+            'device_id': h.get('device_id'),
             'name': h.get('name'),
             'ip': h.get('ip'),
             'connected': h.get('connected'),
             'last_poll': h.get('last_poll'),
             'model_id': h.get('device_info', {}).get('model_id'),
             'proto_version': h.get('firmware_version'),
+            'cards_read_at': h.get('cards_read_at'),
         }
         payload['screen_outputs'] = h.get('screen_outputs', {})
         payload['receiving_cards'] = cards
+        # Per sender card: fibre or copper, and which of its ports are up.
+        # The wall map needs this to stop labelling an Ethernet-patched card's
+        # chains "OPT n". Keys are stringified for JSON.
+        payload['sender_links'] = {str(k): v
+                                   for k, v in (h.get('sender_links') or {}).items()}
+        # Suspected data breaks, derived from the bit-error pattern and from
+        # inventory cards that stopped answering. Empty until a bit-error read
+        # has run — the counter is binary-only and on demand.
+        payload['chain_breaks'] = h.get('chain_breaks') or []
+        payload['bit_errors_read_at'] = h.get('bit_errors_read_at')
+        snmp = h.get('snmp') or {}
+        # SNMP counts screens and output cards independently of R0405. Passed
+        # through as corroboration, never merged into the R0405 numbers.
+        payload['snmp_summary'] = {
+            'available': snmp.get('available'),
+            'screen_count': (snmp.get('screens') or {}).get('screen_count'),
+            'output_card_count': (snmp.get('output') or {}).get('card_count'),
+            'port_count': (snmp.get('output') or {}).get('port_count'),
+        }
     return jsonify(payload)
+
+
+def _populated_sender_cards(cards):
+    """How many sender cards currently have receiving cards behind them.
+
+    This is NOT a correction to the controller's slot count — that count is
+    right. On the H15 R0405 reports slots 20, 22, 28 and 30 and all four are
+    sender cards: two primary and two backup. The backups answer nothing over
+    R0155 and nothing to a per-card binary read, because nothing is running
+    behind them until they take over.
+
+    So the two numbers mean different things and the UI shows both: how many
+    sender cards are installed (from the controller) and how many are carrying
+    panels right now (from the inventory). A drop in the second without a
+    change in the first is a failover or a dead fibre, which is exactly the
+    kind of thing this dashboard exists to show.
+
+    None when there is no inventory to count from.
+    """
+    if not cards:
+        return None
+    slots = {c.get('slot') for c in cards if c.get('slot') is not None}
+    if slots:
+        return len(slots)
+    numbers = {c.get('card_number') for c in cards
+               if c.get('card_number') is not None}
+    return len(numbers) or None
+
+
+def _panel_report(topology, verdict, snapshot_cards, live_cards):
+    """How many receiving cards (panels) the wall has — or that we don't know.
+
+    The processor reports geometry; it does not report how many receiving
+    cards are hanging off each port. That takes an enumeration walk. So the
+    only sources of a real number are a live per-card read or a snapshot that
+    has been confirmed to describe THIS wall. Everything else is `known:
+    false` plus a reason and the command that fixes it.
+    """
+    capacity = panel_capacity((topology or {}).get('canvas'),
+                              _configured_panel_size())
+    report = {'known': False, 'count': None, 'source': None,
+              'capacity': capacity, 'enumerate_hint': ENUMERATE_HINT,
+              'populated_sender_cards': None}
+
+    # How many panels the wall HAS is an inventory question, and the verified
+    # enumeration is the authority on it. A live read answers a different
+    # question — how many were read just now — and reading one 22-card chain
+    # must not restate a 286-panel wall as 22 panels.
+    if verdict['status'] == 'match' and snapshot_cards:
+        report.update({'known': True, 'count': len(snapshot_cards),
+                       'source': 'enumeration',
+                       'read': len(live_cards or []),
+                       'populated_sender_cards': _populated_sender_cards(
+                           snapshot_cards)})
+        return report
+
+    if live_cards:
+        # No verified inventory, so the only count available is what answered.
+        # Flagged as a floor: cards nobody read are not in it.
+        report.update({'known': True, 'count': len(live_cards),
+                       'source': 'device_read',
+                       'read': len(live_cards),
+                       'is_lower_bound': True,
+                       'populated_sender_cards': _populated_sender_cards(
+                           live_cards)})
+        return report
+
+    if verdict['status'] == 'mismatch':
+        report['reason'] = (
+            'The stored enumeration is for a different wall, so the number of '
+            'panels on this one is unknown until it is re-enumerated.')
+    elif verdict['status'] == 'no_snapshot':
+        report['reason'] = ('No enumeration has been run, so the number of '
+                            'panels is unknown.')
+    elif verdict['status'] == 'unverified' and snapshot_cards:
+        # A snapshot that could not be checked. Its count is offered, but as
+        # unverified — it is not promoted to `known`.
+        report.update({'count': len(snapshot_cards), 'source': 'unverified_snapshot',
+                       'reason': ('The stored enumeration could not be checked '
+                                  'against the controller, so this count is '
+                                  'unconfirmed.')})
+    else:
+        report['reason'] = ('No per-card enumeration exists for the wall that '
+                            'is currently configured.')
+    return report
 
 
 @app.route('/api/wall_rendered', methods=['GET'])

@@ -5,7 +5,8 @@
       "name": "novastar-monitor",
       "runtimeExecutable": "python3",
       "runtimeArgs": ["src/app.py"],
-      "port": 8060
+      "port": 8060,
+      "autoPort": false
     }
   ]
 }

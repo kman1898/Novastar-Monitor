@@ -22,9 +22,18 @@ class TestGenerateDemoState:
             assert 40 <= card["temperature_c"] <= 70
 
     def test_voltages_in_range(self):
+        """Demo data must sit in the band real hardware produces.
+
+        The old bounds were 4.5-6.0 V, which no receiving card can report:
+        they came from the same `raw * 0.03` error the demo baselines did.
+        NovaStar's control protocol gives (raw & 0x7F) * 0.1, so a healthy
+        card is around 4.2-4.6 V. Demo mode exists to exercise the UI's own
+        thresholds, and it cannot do that with values the thresholds will
+        never see.
+        """
         state = demo.generate_demo_state()
         for card in state["receiving_cards"]:
-            assert 4.5 <= card["voltage_v"] <= 6.0
+            assert 3.8 <= card["voltage_v"] <= 5.0, card["voltage_v"]
 
     def test_device_info_populated(self):
         state = demo.generate_demo_state()
