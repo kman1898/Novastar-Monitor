@@ -1,10 +1,10 @@
 # NovaStar Monitor — H-Series Findings & Architecture Handoff
 
-**Purpose:** Single-document context dump for picking up this work in a fresh Claude Code session. Everything we've decoded about the H-series LED video splicer protocols, the user's wall topology, what's implemented, and what's next.
+**Purpose:** Single-document context dump for picking up this work in a fresh session. Everything we've decoded about the H-series LED video splicer protocols, the user's wall topology, what's implemented, and what's next.
 
 **User:** Matt Knotts (kman1898) — LED tech, macOS dev environment.
-**Repo root (worktree):** `/Users/mattknotts/Nextcloud/LED/LED Wall Tech/Novastar-Monitor/.claude/worktrees/modest-torvalds`
-**Branch:** `claude/modest-torvalds`
+**Repo root:** `/Users/mattknotts/Nextcloud/LED/LED Wall Tech/Novastar-Monitor`
+**Branch:** `dev/draft`
 **Sister project (separate, do not modify here):** `companion-module-novastar-controller` — Bitfocus Companion CONTROL plugin. This app is **monitoring only**, no control.
 
 ---
@@ -789,9 +789,9 @@ depend on `recvCardId` at all. Compare its total to the known panel count.
 
 ## 7 · User preferences (do not violate)
 
-- **Git:** All work on `dev/draft` branch (or worktree branch like `claude/modest-torvalds`). PRs target `dev/draft`. Main only receives merged PRs.
-- **Commit attribution:** Always commit as kman1898 with `60245031+kman1898@users.noreply.github.com`. **Never include Co-Authored-By Claude lines or any AI attribution.** Use `git -c user.name=... -c user.email=...` to override per-commit.
+- **Git:** All work on `dev/draft`, or a short-lived worktree branch merged into it. PRs target `dev/draft`. Main only receives merged PRs.
+- **Commit attribution:** Always commit as kman1898 with `60245031+kman1898@users.noreply.github.com`. **Never include Co-Authored-By lines or any AI attribution of any kind.** Use `git -c user.name=... -c user.email=...` to override per-commit.
 - **Brevity:** User is action-oriented. Tight responses, no preamble, no end-of-turn summaries unless asked.
 - **No emojis** in code or commits unless explicitly requested.
-- **No screenshots** unless absolutely needed for visual verification (image accumulation hits Claude Code's per-session limit fast). When verification is needed, ask for "one screenshot only."
+- **No screenshots** unless absolutely needed for visual verification (images accumulate and hit the per-session limit fast). When verification is needed, ask for "one screenshot only."
 - **This is a monitoring app, not control.** Brightness and other write/control concerns are handled by the separate Companion module — out of scope here.

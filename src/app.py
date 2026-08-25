@@ -2376,7 +2376,7 @@ socketio.run = _run_server
 
 
 if __name__ == '__main__':
-    # Port can be overridden via NSM_PORT env var (used by .claude/launch.json
+    # Port can be overridden via NSM_PORT env var (used by the editor's launch config
     # for the preview server). Defaults to 8060 in dev / 8050 in prod-bundle.
     port = int(os.environ.get('NSM_PORT', 8060))
     # Debug (and with it the Werkzeug reloader) is opt-in via NSM_DEBUG. It
