@@ -3023,29 +3023,6 @@ class NovaStar_Device:
             if len(hist[key]) > HISTORY_LIMIT:
                 del hist[key][:-HISTORY_LIMIT]
 
-            # Update live_monitoring and history from per-card aggregate.
-            online_cards = [c for c in cards if c.get("online")]
-            if online_cards:
-                avg_temp = round(sum(c["temperature_c"] for c in online_cards) / len(online_cards), 1)
-                avg_volt = round(sum(c["voltage_v"] for c in online_cards) / len(online_cards), 2)
-                max_temp = max(c["temperature_c"] for c in online_cards)
-                # Merge per-card aggregate into live_monitoring
-                self.state["live_monitoring"].update({
-                    "card_count": len(online_cards),
-                    "temperature_c": avg_temp,
-                    "temperature_max_c": max_temp,
-                    "voltage_v": avg_volt,
-                    "online": True,
-                })
-                # History (keep last 300 samples)
-                hist = self.state["history"]
-                hist["temperature"].append(avg_temp)
-                hist["voltage"].append(avg_volt)
-                hist["timestamps"].append(now.strftime("%H:%M:%S"))
-                for key in ("temperature", "voltage", "timestamps"):
-                    if len(hist[key]) > 300:
-                        hist[key] = hist[key][-300:]
-
 
 class DeviceManager:
     """Manages multiple NovaStar devices and their polling threads."""

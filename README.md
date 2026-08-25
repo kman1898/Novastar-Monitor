@@ -379,6 +379,23 @@ No test opens a socket to real hardware; importing `app` never starts a poller.
 
 ## Changelog
 
+### v0.4.0
+- H-series support: JSON UDP control protocol, binary per-card reads, and wall
+  enumeration that reproduces a known panel count
+- Read-only SNMPv2c client for chassis health — no dependencies, GET/GETNEXT
+  only, and no write path by design
+- Removed the `W0120` keepalive: it claims the controller role and coincided
+  with losing Bitfocus Companion control mid-show
+- Per-card temperature, voltage, link state and presence from one binary
+  register per card
+- Data break detection, including the case where a backup sender card keeps
+  the panels lit and nothing else looks wrong
+- Voltage decode corrected to `(raw & 0x7F) * 0.1` per NovaStar's control
+  protocol; the previous formula over-read by roughly 0.9 V
+- A card that does not answer is reported as unknown, not offline; alerts are
+  gated on how recently the readings were taken
+- Moved off port 8050, which collides with LED Raster Designer
+
 ### v0.3.0
 - Simulation mode: toggle a simulated VX1000 (14 cards) from Settings, system tray, or CLI (`--demo`)
 - Structured JSON logging with rotation (20 MB, 2 backups), event/request/error logging
