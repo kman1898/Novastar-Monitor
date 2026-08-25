@@ -158,16 +158,23 @@ Offset  Sample Values   Meaning (hypothesized)
 27+     00...           Padding/reserved
 ```
 
-**Temperature conversion (estimated):**
+**Temperature conversion — CONFIRMED by the vendor document:**
 - Raw values seen: 0x6C=108, 0x6E=110, 0x70=112, 0x72=114, 0x74=116, 0x76=118
-- Likely: temp_celsius = raw_value * 0.5 → range 54-59°C
-- Or: temp_celsius = raw_value - 60 → range 48-58°C
-- Needs calibration against NovaLCT's displayed value
+- `temp_celsius = raw_value / 2` → range 54-59°C
+- NovaStar *H Series Video Wall Splicers Control Protocol* §4.3.4 (identical in
+  V1.0.18 and V1.0.20): units of 0.5 °C, "a value of 104 represents a
+  temperature of 52°C". The `raw - 60` alternative guessed at here is wrong.
 
-**Voltage conversion (estimated):**
+**Voltage conversion — CONFIRMED by the vendor document:**
 - Raw values: 0xAC=172, 0xAD=173, 0xAE=174
-- Likely: voltage = raw_value * 0.03 → ~5.1-5.2V
-- Needs calibration
+- `voltage = (raw_value & 0x7F) * 0.1` → 4.4, 4.5, 4.6 V
+- Same document, §4.3.4 and §5.4.2: "The lower 7 bits represent the voltage
+  value, in units of 0.1V. For instance, a value of 172 indicates a voltage of
+  4.4V."
+- This section previously estimated `raw_value * 0.03 → ~5.1-5.2V`, and that
+  guess was adopted as fact elsewhere in the project. It is wrong: bit 7 is not
+  part of the number, and these receiving cards run at roughly 4.2 V, not 5 V.
+  See "Voltage formula" in `docs/H_SERIES_FINDINGS.md` for the full unwind.
 
 ---
 

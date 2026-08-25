@@ -26,7 +26,7 @@ from launcher_settings import load_settings, save_settings, get_network_interfac
 
 def start_flask_server(settings):
     host = settings.get('interface', '127.0.0.1')
-    port = int(settings.get('port', 8050))
+    port = int(settings.get('port', 8060))
     from app import app, socketio, log_event
     log_event('launcher_start', {
         'platform': 'macos',
@@ -41,7 +41,7 @@ def start_flask_server(settings):
 
 def get_display_url(settings):
     host = settings.get('interface', '127.0.0.1')
-    port = settings.get('port', 8050)
+    port = settings.get('port', 8060)
     display_host = host if host != '0.0.0.0' else '127.0.0.1'
     return f'http://{display_host}:{port}'
 
@@ -74,7 +74,7 @@ def main():
             @rumps.clicked('Simulation Mode')
             def toggle_simulation(self, sender):
                 enable = not sender.state
-                port = settings.get('port', 8050)
+                port = settings.get('port', 8060)
                 url = f'http://127.0.0.1:{port}/api/demo'
                 data = json.dumps({'enable': enable}).encode()
                 req = urllib.request.Request(url, data=data,

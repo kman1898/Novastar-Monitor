@@ -28,7 +28,7 @@ from launcher_settings import (
 def start_flask_server(settings):
     """Import and run the Flask app in a background thread."""
     host = settings.get('interface', '127.0.0.1')
-    port = int(settings.get('port', 8050))
+    port = int(settings.get('port', 8060))
 
     from app import app, socketio, log_event
     log_event('launcher_start', {
@@ -45,7 +45,7 @@ def start_flask_server(settings):
 def get_display_url(settings):
     """Build the display URL from settings."""
     host = settings.get('interface', '127.0.0.1')
-    port = settings.get('port', 8050)
+    port = settings.get('port', 8060)
     display_host = host if host != '0.0.0.0' else '127.0.0.1'
     return f'http://{display_host}:{port}'
 
@@ -102,7 +102,7 @@ def run_tray(settings):
         )
 
     host = settings.get('interface', '127.0.0.1')
-    port = settings.get('port', 8050)
+    port = settings.get('port', 8060)
     display_host = host if host != '0.0.0.0' else '127.0.0.1'
 
     def toggle_run_at_login(icon, item):
