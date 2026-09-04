@@ -200,6 +200,42 @@ def test_wall_snapshot_missing_file_returns_none(client, tmp_path):
     assert appmod.load_wall_snapshot(str(tmp_path / 'nope.json')) == (None, None)
 
 
+# ── Stale power flags in an older snapshot ────────────────
+#
+# No current decoder can produce False for these fields — `_power_status`
+# returns True or None only. A False therefore came from the older parser that
+# read 0 as healthy, before NovaStar documented 0 = Fault / 1 = Normal.
+# `attach_readings` merges only non-None readings, so a stale False survives
+# every subsequent read, and the Wall View paints those cards red for a fault
+# no live reading claims. Fifteen cards on the stored 286-panel snapshot were
+# doing exactly that.
+
+def test_stale_false_power_flags_are_cleared_on_load(client, tmp_path):
+    card = dict(make_card(), primary_power_ok=False, backup_power_ok=False)
+    write_snapshot(tmp_path, cards=[card])
+    snap, _ = appmod.load_wall_snapshot()
+    assert snap['cards'][0]['primary_power_ok'] is None
+    assert snap['cards'][0]['backup_power_ok'] is None
+
+
+def test_healthy_power_flags_survive_the_load(client, tmp_path):
+    """Only False is stale. True is what the current decoder writes for a
+    supply the card reported as Normal, and it has to come through."""
+    card = dict(make_card(), primary_power_ok=True, backup_power_ok=None)
+    write_snapshot(tmp_path, cards=[card])
+    snap, _ = appmod.load_wall_snapshot()
+    assert snap['cards'][0]['primary_power_ok'] is True
+    assert snap['cards'][0]['backup_power_ok'] is None
+
+
+def test_clearing_stale_flags_survives_a_snapshot_without_cards(client,
+                                                                tmp_path):
+    appmod._drop_stale_power_flags({})
+    appmod._drop_stale_power_flags({'cards': None})
+    appmod._drop_stale_power_flags({'cards': ['not a dict']})
+    appmod._drop_stale_power_flags(None)
+
+
 # ── Stale snapshot detection ──────────────────────────────
 #
 # The failure this guards against: the operator reconfigured the wall, the

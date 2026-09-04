@@ -194,10 +194,15 @@ def make_probe(server, register="biterr", timeout=0.15, pace=0):
 class FakeJSONClient:
     """Stands in for HSeriesJSONClient. Answers only for known addresses."""
 
-    def __init__(self, known=(), screens=None, output_info=None):
+    def __init__(self, known=(), screens=None, output_info=None,
+                 power_status=0):
         self.known = set(known)
         self.screens = screens
         self.output_info = output_info
+        # 0 is what the capture this fake reproduces actually sent. NovaStar
+        # documents 0 = Fault / 1 = Normal, so a test that wants a supply
+        # reported healthy has to ask for 1.
+        self.power_status = power_status
         self.requested = []
         self.closed = False
 
@@ -209,7 +214,8 @@ class FakeJSONClient:
                 out.append({
                     "cmd": "R0155", "deviceId": 0, "slotId": slot,
                     "portId": port, "recvCardId": card_id,
-                    "power0Status": 0, "power1Status": 0, "brightness": 127,
+                    "power0Status": self.power_status,
+                    "power1Status": self.power_status, "brightness": 127,
                     "temp": 88, "voltage": 170, "ack": "Ok",
                 })
             else:
@@ -1032,8 +1038,18 @@ class TestAttachReadings:
         # raw 170 & 0x7F = 42, units of 0.1 V → 4.2 V. Vendor doc §5.4.2.
         assert cards[0]["voltage_v"] == 4.2
         assert cards[0]["brightness"] == 127
-        assert cards[0]["primary_power_ok"] is True
+        # The fixture reports 0 on both supplies, which is unknown rather than
+        # healthy, and an unknown reading is not merged onto the card at all.
+        assert cards[0].get("primary_power_ok") is None
         assert cards[0]["online"] is True
+
+    def test_a_healthy_power_flag_is_merged(self):
+        """1 is the vendor's Normal value and has to reach the card entry."""
+        cards = [ew.make_card_entry(1, 20, 0, 0)]
+        client = FakeJSONClient(known={(20, 0, 0)}, power_status=1)
+        ew.attach_readings(client, cards)
+        assert cards[0]["primary_power_ok"] is True
+        assert cards[0]["backup_power_ok"] is True
 
     def test_unreadable_cards_are_kept_not_dropped(self):
         # The whole point: a card that exists but can't be read is a finding,

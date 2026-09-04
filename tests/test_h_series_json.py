@@ -690,16 +690,32 @@ class TestParseReceivingCard:
         assert r["voltage_v"] == 4.2             # raw 170 & 0x7F = 42 → 4.2 V
         assert r["voltage_raw"] == 170
         assert r["brightness"] == 127
-        assert r["primary_power_ok"] is True
-        assert r["backup_power_ok"] is True
+        # This capture reports 0 on both supplies. Vendor-documented that is
+        # "Fault", but most of a lit wall reports it, so it reads as unknown.
+        assert r["primary_power_ok"] is None
+        assert r["backup_power_ok"] is None
 
     def test_power_flags_are_true_or_unknown_never_false(self):
-        """`0 = healthy` held up; `non-zero = failed` did not, so non-zero is
-        reported as unknown rather than as a fault. See _power_status."""
+        """1 = Normal is the only value trusted. Everything else is unknown —
+        never False, which would put a supply fault on most of a healthy
+        wall. See _power_status."""
         r = hsj.parse_receiving_card({**self.CAPTURED,
-                                      "power0Status": 0, "power1Status": 2})
+                                      "power0Status": 1, "power1Status": 2})
         assert r["primary_power_ok"] is True
         assert r["backup_power_ok"] is None
+
+    def test_documented_fault_value_reads_as_unknown_not_false(self):
+        """0 is the vendor's Fault value, and 21 of 36 cards on the live wall
+        report it on both supplies while lit and answering. Reporting that as
+        a fault would alarm on most of a working wall, so it is unknown until
+        NovaStar explains it."""
+        r = hsj.parse_receiving_card({**self.CAPTURED,
+                                      "power0Status": 0, "power1Status": 0})
+        assert r["primary_power_ok"] is None
+        assert r["backup_power_ok"] is None
+        # The raw values survive so the question stays answerable later.
+        assert r["power0_status_raw"] == 0
+        assert r["power1_status_raw"] == 0
 
     def test_missing_power_fields_are_unknown(self):
         r = hsj.parse_receiving_card({"cmd": "R0155", "ack": "Ok"})
@@ -767,8 +783,10 @@ class TestParseReceivingCardCentiSchema:
         assert r["voltage_v"] == 4.4          # 440 / 100
         assert r["voltage_raw"] == 440
         assert r["brightness"] == 25
-        assert r["primary_power_ok"] is True
-        assert r["backup_power_ok"] is True
+        # 0 on both supplies — documented Fault, but reported by most of this
+        # wall while lit, so unknown rather than a fault.
+        assert r["primary_power_ok"] is None
+        assert r["backup_power_ok"] is None
 
     def test_temperature_is_not_the_byte_scaling(self):
         """The bug: 3700 / 2 = 1850 °C, which is what the operator saw."""
@@ -818,20 +836,32 @@ class TestParseReceivingCardCentiSchema:
 
     def test_reporting_card_with_both_power_flags_set(self):
         """Fifteen plainly working cards reported power0/1Status 1,1 while
-        also reporting 41-42 C and 4.0-4.1 V. A card cannot measure and send
-        its own temperature through a failed primary supply, so "both supplies
-        failed" is not a tenable reading — it raised a warning every polling
-        cycle on a lit, healthy wall. Unknown, not failed."""
+        also reporting 41-42 C and 4.0-4.1 V. That was read here for a long
+        time as evidence that 1 could not mean healthy — it raised a warning
+        every polling cycle on a lit wall. NovaStar's documented polarity is
+        0 Fault / 1 Normal, so those cards were reporting two healthy supplies
+        all along."""
         r = hsj.parse_receiving_card({**self.CAPTURED,
                                       "power0Status": 1, "power1Status": 1})
         assert r["online"] is True
-        assert r["primary_power_ok"] is None
-        assert r["backup_power_ok"] is None
-        # Its readings are still real — only the flags are in question.
+        assert r["primary_power_ok"] is True
+        assert r["backup_power_ok"] is True
+        # Its readings are still real.
         assert r["temperature_c"] == 37.0
-        # The raw values are kept so the meaning can be settled later.
+        # The raw values are kept whatever the verdict.
         assert r["power0_status_raw"] == 1
         assert r["power1_status_raw"] == 1
+
+    def test_a_healthy_flag_on_a_non_reporting_card_claims_nothing(self):
+        """The trap, in its new orientation: 1 is the healthy value now, and a
+        card that is not reporting fills every field with placeholders. A
+        placeholder 1 must not read as 'supply healthy' any more than a
+        placeholder 0 read as it before."""
+        r = hsj.parse_receiving_card({**self.ABSENT,
+                                      "power0Status": 1, "power1Status": 1})
+        assert r["online"] is False
+        assert r["primary_power_ok"] is None
+        assert r["backup_power_ok"] is None
 
     def test_failed_ack_yields_no_readings(self):
         r = hsj.parse_receiving_card({**self.CAPTURED, "ack": "Fail"})
@@ -944,6 +974,27 @@ class TestCentiDecoders:
         assert hsj.decode_volt_centi(430) == 4.3
         assert hsj.decode_volt_centi(None) is None
         assert hsj.decode_volt_centi("nope") is None
+
+    def test_vendor_worked_examples(self):
+        """Pinned so the centi scalings cannot drift back to a guess.
+
+        NovaStar's corrected R0155 field document, 2026-09-04:
+        "a value of 4200 represents a temperature of 42 degrees Celsius" and
+        "a value of 480 represents a voltage of 4.8V".
+        """
+        assert hsj.decode_temp_centi(4200) == 42.0
+        assert hsj.decode_volt_centi(480) == 4.8
+
+    def test_vendor_examples_through_the_parser(self):
+        """The same two values, decoded the way the app actually reaches
+        them — through parse_receiving_card, schema detection included."""
+        r = hsj.parse_receiving_card({
+            "cmd": "R0155", "ack": "Ok", "workStatus": 0,
+            "temp": 4200, "volt": 480,
+        })
+        assert r["schema"] == hsj.SCHEMA_CENTI
+        assert r["temperature_c"] == 42.0
+        assert r["voltage_v"] == 4.8
 
 
 class TestByteDecoders:
@@ -1123,3 +1174,106 @@ class TestOutputLinkMedium:
         by_slot = {s['slot_id']: s for s in parsed['slots']}
         assert by_slot[20]['output_links']['medium'] == 'opt'
         assert by_slot[22]['output_links']['medium'] == 'ethernet'
+
+
+class TestLinkStatusDecoding:
+    """R0102 `linkstatus`, per NovaStar's answer of 2026-09-04:
+    0 not connected, 1 connected, 2 redundancy not set, 3 redundancy enabled.
+    """
+
+    def test_every_documented_value_has_a_label(self):
+        assert hsj.decode_link_status(0)['label'] == 'cable_disconnected'
+        assert hsj.decode_link_status(1)['label'] == 'cable_connected'
+        assert hsj.decode_link_status(2)['label'] == 'redundancy_not_set'
+        assert hsj.decode_link_status(3)['label'] == 'redundancy_enabled'
+
+    def test_the_two_axes_are_independent(self):
+        """The enum folds cable presence and redundancy config into one
+        number, so each value speaks to exactly one of them and says nothing
+        about the other. Collapsing it to a single boolean would make
+        'redundancy not set' (2) look identical to 'connected' (1)."""
+        cable_down = hsj.decode_link_status(0)
+        assert cable_down['cable_connected'] is False
+        assert cable_down['redundancy_enabled'] is None
+
+        cable_up = hsj.decode_link_status(1)
+        assert cable_up['cable_connected'] is True
+        assert cable_up['redundancy_enabled'] is None
+
+        no_redundancy = hsj.decode_link_status(2)
+        assert no_redundancy['cable_connected'] is None
+        assert no_redundancy['redundancy_enabled'] is False
+
+        redundancy = hsj.decode_link_status(3)
+        assert redundancy['cable_connected'] is None
+        assert redundancy['redundancy_enabled'] is True
+
+    def test_an_unknown_value_claims_nothing(self):
+        """The byte[12] lesson: mapping every unrecognised value onto a known
+        meaning labelled 124 healthy panels disconnected."""
+        got = hsj.decode_link_status(11)
+        assert got['state'] == 11
+        assert got['label'] is None
+        assert got['cable_connected'] is None
+        assert got['redundancy_enabled'] is None
+
+    def test_missing_value_is_unknown(self):
+        got = hsj.decode_link_status(None)
+        assert got['state'] is None
+        assert got['cable_connected'] is None
+
+
+class TestParseSlotInfo:
+
+    def test_a_single_top_level_value(self):
+        parsed = hsj.parse_slot_info({'cmd': 'R0102', 'slotId': 20,
+                                      'linkstatus': 3})
+        assert parsed['slot_id'] == 20
+        assert len(parsed['links']) == 1
+        assert parsed['links'][0]['index'] == 0
+        assert parsed['links'][0]['label'] == 'redundancy_enabled'
+        assert parsed['redundancy_enabled'] is True
+        assert parsed['cable_connected'] is None
+
+    def test_a_per_connector_block(self):
+        parsed = hsj.parse_slot_info({
+            'cmd': 'R0102', 'slotId': 22,
+            'linkstatus': {'link0': 1, 'link1': 1, 'link2': 0},
+        })
+        assert [l['state'] for l in parsed['links']] == [1, 1, 0]
+        assert [l['index'] for l in parsed['links']] == [0, 1, 2]
+        # One connector says a cable is connected, so the card has one.
+        assert parsed['cable_connected'] is True
+        assert parsed['redundancy_enabled'] is None
+
+    def test_a_block_stops_at_the_first_gap(self):
+        parsed = hsj.parse_slot_info({
+            'linkstatus': {'link0': 1, 'link2': 1},
+        })
+        assert len(parsed['links']) == 1
+
+    def test_a_list_form(self):
+        parsed = hsj.parse_slot_info({'linkstatus': [0, 0]})
+        assert [l['state'] for l in parsed['links']] == [0, 0]
+        assert parsed['cable_connected'] is False
+
+    def test_summaries_are_none_when_nothing_speaks_to_them(self):
+        """Every connector reporting a redundancy value says nothing at all
+        about whether a cable is plugged in."""
+        parsed = hsj.parse_slot_info({'linkstatus': {'link0': 2, 'link1': 2}})
+        assert parsed['cable_connected'] is None
+        assert parsed['redundancy_enabled'] is False
+
+    def test_no_linkstatus_field(self):
+        parsed = hsj.parse_slot_info({'cmd': 'R0102', 'slotId': 20})
+        assert parsed['links'] == []
+        assert parsed['cable_connected'] is None
+        assert parsed['redundancy_enabled'] is None
+
+    def test_raw_is_kept(self):
+        reply = {'cmd': 'R0102', 'slotId': 20, 'linkstatus': 1}
+        assert hsj.parse_slot_info(reply)['raw'] == reply
+
+    def test_non_dict_input(self):
+        assert hsj.parse_slot_info(None) is None
+        assert hsj.parse_slot_info('R0102') is None

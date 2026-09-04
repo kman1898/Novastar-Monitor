@@ -29,6 +29,7 @@ from novastar_protocol import (
 )
 from h_series_json import (
     HSeriesJSONClient, parse_device_details, parse_receiving_card,
+    parse_slot_info,
 )
 from snmp_client import (
     DEFAULT_COMMUNITY as SNMP_COMMUNITY, SNMP_PORT, SNMPClient,
@@ -1637,7 +1638,17 @@ class NovaStar_Device:
         return True
 
     def _refresh_sender_links(self):
-        """Cache each output card's OPT / Ethernet link state from R0100."""
+        """Cache each output card's OPT / Ethernet link state from R0100.
+
+        Then one R0102 per output card for its `linkstatus` — the cable and
+        redundancy state NovaStar pointed at for detecting primary/backup
+        switching. It lands on the same per-slot dict under
+        `slot_link_status`, so nothing downstream has to change to keep
+        working. That key is deliberately NOT called `link_status`: two
+        different things already answer to that name — the binary per-card
+        PRIMARY/BACKUP string, and the SNMP `.30.5.1` integer — and a third
+        meaning under the same name would be misread.
+        """
         r0100 = self.json_client.get_device_details()
         details = parse_device_details(r0100) if r0100 is not None else None
         if not details:
@@ -1655,7 +1666,34 @@ class NovaStar_Device:
                 continue
             links[slot_id] = out
         if links:
+            self._refresh_slot_link_status(links)
             self._draft["sender_links"] = links
+
+    def _refresh_slot_link_status(self, links):
+        """Merge R0102 `linkstatus` into each entry of `links`, in place.
+
+        One datagram per output card, inside the topology refresh, so it
+        inherits the 600 s cache rather than adding to the poll cycle. On a
+        four-card chassis that is four datagrams every ten minutes.
+
+        A slot that does not answer, or answers something this can't read, is
+        left without the key rather than given a default — absent means "not
+        reported", and the UI has to be able to tell that from "reported down".
+
+        Connector 0 only. Whether `linkstatus` is one value per card or one per
+        connector is unknown until a reply is captured; if it turns out to be
+        per-connector this needs a sweep of 0..3 here.
+        """
+        for slot_id, entry in links.items():
+            try:
+                r0102 = self.json_client.get_slot_info(slot_id)
+            except Exception:
+                logger.debug("R0102 failed for slot %s", slot_id,
+                             exc_info=True)
+                continue
+            parsed = parse_slot_info(r0102) if r0102 is not None else None
+            if parsed and parsed.get("links"):
+                entry["slot_link_status"] = parsed
 
     def _refresh_topology(self):
         """Poll-loop entry point: re-read topology only if the cache aged out."""

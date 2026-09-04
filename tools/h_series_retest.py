@@ -192,6 +192,35 @@ def main(ip):
 
     client.close()
 
+    # ── 7. R0102 linkstatus ───────────────────────────────────────────────
+    print("\n--- 7. R0102 linkstatus (NovaStar's failover answer) ---")
+    print("    0 cable not connected / 1 connected / 2 redundancy not set /")
+    print("    3 redundancy enabled. NO R0102 reply has ever been captured, so")
+    print("    print the WHOLE object — the container shape matters as much as")
+    print("    the value. Run this once on a healthy wall, then pull a cable at")
+    print("    a known panel and run it again. If the value moves, 3 is live")
+    print("    failover state; if it doesn't, 3 is only configuration.")
+    try:
+        import h_series_json as hsj              # noqa: E402
+        jc = hsj.HSeriesJSONClient(ip)
+        for slot in H15_OUTPUT_SLOTS:
+            for connector in (0, 1, 2, 3):
+                reply = jc.get_slot_info(slot, connector_id=connector)
+                if reply is None:
+                    show(f"slot {slot} connector {connector}", "no answer")
+                    continue
+                show(f"slot {slot} connector {connector} raw",
+                     json.dumps(reply))
+                parsed = hsj.parse_slot_info(reply)
+                if parsed:
+                    show("    decoded",
+                         f"links={parsed['links']} "
+                         f"cable={parsed['cable_connected']} "
+                         f"redundancy={parsed['redundancy_enabled']}")
+        jc.close()
+    except Exception as exc:
+        print(f"  skipped: {exc}")
+
     # ── 6. Rate limit: requests, or cards actually reached? ───────────────
     print("\n--- 6. Does the rate limit count REQUESTS or CARDS REACHED? ---")
     print("    The H2 with no panels answered 220 reads with no silence. If a")

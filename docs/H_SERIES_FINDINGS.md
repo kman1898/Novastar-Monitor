@@ -630,6 +630,12 @@ anything unrecognised is `UNKNOWN`. What 11 actually means is undecoded.
 
 ### `powerNStatus` non-zero does NOT mean a failed supply
 
+> **SUPERSEDED 2026-09-04 — see §6.7.** The vendor has documented `0 = Fault,
+> 1 = Normal`. The half of this section that says `0 = healthy` is wrong; the
+> half that says a non-zero flag on a reporting card is not a fault is right,
+> for the opposite reason to the one given here. Kept because the reasoning
+> below is how a correct observation got attached to a backwards conclusion.
+
 `0 = healthy` held up. `non-zero = failed` did not. Fifteen cards reported
 `power0Status: 1` **and** `power1Status: 1` while simultaneously reporting
 41–42 °C and 4.0–4.1 V over R0155. A card cannot measure and transmit its own
@@ -784,6 +790,106 @@ depend on `recvCardId` at all. Compare its total to the known panel count.
 - **245 panels / 16 chains / one sender card** — the H2 test rig in the
   `Bit errors detection` / `More` captures. This is the one that *verifies*
   §6.5, since counting distinct `(byte7, byte8)` pairs reproduces 245 exactly.
+
+---
+
+## 6.7 · Vendor answers, 2026-09-04 (supersede everything above that conflicts)
+
+NovaStar replied with an updated `R0155` field document plus answers on failover
+detection and the rate limit. All three ship with **H firmware V2.3.0.0**.
+
+### R0155 — the "centi" reply is the official one, and the old doc was wrong
+
+The vendor's words: the existing R0155 documentation "does indeed lack some
+information and has unit errors." The corrected page documents exactly the reply
+this project has been calling `SCHEMA_CENTI`, guessed at from captures:
+
+| Field | Documented meaning |
+|---|---|
+| `temp` | units of **0.01 °C** — `4200` = 42 °C |
+| `volt` | units of **0.01 V** — `480` = 4.8 V |
+| `tempMax` | receiving card maximum operating temperature (whole °C) |
+| `workStatus` | 0 Normal / 1 Abnormal |
+| `tempStatus` | 0 Normal / **1 Alarm** / 2 Abnormal |
+| `voltStatus` | 0 Normal / **1 Alarm** / 2 Abnormal |
+| `brightness` | receiving card brightness |
+| `power0Status` | receiving card **power 1** status — 0 Fault / 1 Normal |
+| `power1Status` | receiving card **power 2** status — 0 Fault / 1 Normal |
+
+The request encoding is confirmed too: `param0` slot, `param1` network port,
+`param2` low 8 bits of the receiving card ID, `param3` high 8 bits — their
+worked example is card 267 → `param2: 11, param3: 1`. That is what
+`H_SeriesJSONClient._r0155()` already builds.
+
+`decode_temp_centi()` and `decode_volt_centi()` were right. Their scaling is no
+longer inference and is pinned to the vendor's worked examples in
+`tests/test_h_series_json.py`.
+
+`SCHEMA_BYTE` stays supported. It was captured off real hardware and uses a
+different key name (`voltage`, not `volt`), so it is a genuine second reply
+shape, not the documentation error — but only the centi form is now documented,
+and the discriminator remains key presence, never value range.
+
+### `powerNStatus` polarity is inverted from what this project assumed
+
+Two vendor documents now agree: **0 = Fault, 1 = Normal**. This project had
+`0 → healthy`. That is corrected.
+
+It also resolves the odd observation in the section above. Fifteen cards
+reporting `power0Status: 1` and `power1Status: 1` while sitting at 41–42 °C and
+4.0–4.1 V were never anomalous — under the documented polarity they are simply
+the cards reporting **two healthy supplies**.
+
+What is still unexplained is the other direction: on the 286-panel config, 21
+of 36 cards report `0` on **both** fields while lit and answering. Read
+literally that is "both supplies failed" on a card that is plainly running.
+Almost certainly it means a supply that is not fitted or not monitored — these
+panels are single-supply — but the vendor has not said so.
+
+So the mapping is asymmetric on purpose, and nothing alerts on it either way:
+
+| Value | Read as |
+|---|---|
+| `1` | healthy — vendor-documented Normal |
+| `0` | **unknown** — documented Fault, but seen on the majority of a healthy wall |
+| absent / non-reporting card | unknown |
+
+The naming also changes: these are **power supply 1 and power supply 2**, not
+primary and backup. The internal keys `primary_power_ok` / `backup_power_ok`
+keep their names for compatibility but mean supply 1 / supply 2.
+
+### Failover detection — R0102 `linkstatus`
+
+The answer to the question this project cared about most. `R0102` reads the
+sender card's `linkstatus`:
+
+| Value | Meaning |
+|---|---|
+| 0 | Network cable not connected |
+| 1 | Network cable connected |
+| 2 | Redundancy not set |
+| 3 | **Redundancy enabled** |
+
+This is a sender-card-level read — one request per slot/port rather than one per
+panel — so it costs nothing against the rate limit that makes the per-card
+binary path expensive. It does not say which *panels* moved to the backup, so it
+complements `detect_chain_breaks()` rather than replacing it.
+
+Note this is a different field from `R0100`'s `lightstatus` / `linkstatus`
+blocks, which report OPT-vs-Ethernet port state and carry no redundancy
+information.
+
+### The 150–200 read limit — fixed by firmware, not by pacing
+
+The vendor confirms the limit is real and offers **customized firmware that
+reads over TCP port 7000 with batch processing and large data packets**, rolling
+into V2.3.0.0. That is the bulk read this project asked for in §10a, and it
+removes the whole reason the per-card sweep has to stop and rest.
+
+Nothing is implemented for it. Port 7000 has never been seen on the wire here,
+and the frame format is undocumented — this needs a capture against a unit
+running V2.3.0.0 before any code is written. Until then the pacing, resting and
+re-read machinery in `enumerate_wall.py` and `device_manager.py` stays.
 
 ---
 

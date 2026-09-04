@@ -118,15 +118,26 @@
     return C_BAD;
   }
 
-  // A card flags a supply fault when exactly one of its two supplies reports
-  // bad. Both flagged at once is usually an R0155 artifact from a transient
-  // timeout rather than a real double-supply failure — shown as a warning.
+  // NovaStar documents the R0155 supply flags as 0 = Fault, 1 = Normal, so
+  // `true` is a supply confirmed healthy. `null` is unknown, and it is COMMON:
+  // 0 is the documented fault value but most of a lit wall reports it, so the
+  // decoder refuses to call it either way (h_series_json._power_status).
+  //
+  // 'ok' therefore requires BOTH supplies confirmed. One confirmed and one
+  // unknown is 'partial', not 'ok' — the legend for green says "both supplies
+  // OK", and painting a half-known card green would make that a false claim.
+  //
+  // `false` cannot arrive from a live read any more. The branches for it stay
+  // because the snapshot loader has to cope with older files, and because they
+  // become live the moment NovaStar explains what 0 means on a card that is
+  // plainly running.
   function powerState(card) {
     const p = card.primary_power_ok;
     const b = card.backup_power_ok;
     if (p == null && b == null) return 'unknown';
     if (p === false && b === false) return 'suspect';
     if (p === false || b === false) return 'fault';
+    if (p !== true || b !== true) return 'partial';
     return 'ok';
   }
 
@@ -236,6 +247,7 @@
     const power = powerState(card);
     if (power === 'fault') parts.push('supply fault');
     else if (power === 'suspect') parts.push('both supplies flagged');
+    else if (power === 'partial') parts.push('one supply not reported');
     // Age of *this* card's numbers. Cards refresh a chain at a time now, so
     // neighbouring cells can legitimately be hours apart.
     parts.push(cardReadLabel(card));
@@ -1200,7 +1212,7 @@
         swatch('Both supplies OK', C_OK),
         swatch('One supply down', C_BAD),
         swatch('Both flagged (suspect reading)', C_WARN),
-        swatch('No data', C_NO_DATA),
+        swatch('Not fully reported', C_NO_DATA),
         swatch('Offline', C_NO_DATA, 'is-offline'),
       ];
     } else if (mode === 'bit_errors') {

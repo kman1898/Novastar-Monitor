@@ -658,6 +658,118 @@ def parse_output_links(slot):
     }
 
 
+# ── R0102 sender-card link status ──────────────────────────────────────────
+#
+# NovaStar, by email 2026-09-04, answering "how do we detect primary/backup
+# link switching": R0102 reads the sender card's `linkstatus`, encoded
+#
+#     0: Network cable not connected
+#     1: Network cable connected
+#     2: Redundancy not set
+#     3: Redundancy enabled
+#
+# That enum folds TWO independent facts into one number. 0 and 1 answer "is a
+# cable plugged in"; 2 and 3 answer "is redundancy configured". A value tells
+# you about one axis and says nothing about the other, so it cannot be reduced
+# to a single boolean — `up = bool(state)` would make "redundancy not set"
+# indistinguishable from "cable connected". Each axis gets its own tri-state.
+#
+# NOT YET SEEN ON THE WIRE. No R0102 reply has been captured from this
+# hardware, so the reply *shape* below is defensive rather than observed: the
+# field is read whether the device puts it at the top level, in a per-connector
+# `{link0..linkN}` block, or in a list. The encoding is the vendor's; the
+# container is a guess. Verify against hardware before anything alerts on it —
+# see docs/NEXT_HARDWARE_SESSION.md.
+#
+# Also unsettled: whether "Redundancy enabled" means redundancy is CONFIGURED
+# or that the card is CURRENTLY carrying the backup path. Those are very
+# different answers to "are we running on backup right now", and the vendor's
+# wording does not decide it. Nothing in this project treats 3 as live failover
+# until that is confirmed.
+LINK_STATUS_LABELS = {
+    0: "cable_disconnected",
+    1: "cable_connected",
+    2: "redundancy_not_set",
+    3: "redundancy_enabled",
+}
+
+# Which axis each value speaks to: (cable_connected, redundancy_enabled).
+# None means "this value says nothing about that axis".
+_LINK_STATUS_AXES = {
+    0: (False, None),
+    1: (True, None),
+    2: (None, False),
+    3: (None, True),
+}
+
+
+def decode_link_status(state):
+    """One R0102 `linkstatus` value → what it actually claims.
+
+    Returns a dict with the raw `state`, a `label`, and the two independent
+    tri-states. An unrecognised value keeps its raw form and claims nothing —
+    the same rule byte[12] of the binary live-monitoring register needed after
+    "anything unrecognised is disconnected" labelled 124 healthy panels down.
+    """
+    raw = _maybe_int(state)
+    cable, redundancy = _LINK_STATUS_AXES.get(raw, (None, None))
+    return {
+        "state": raw,
+        "label": LINK_STATUS_LABELS.get(raw),
+        "cable_connected": cable,
+        "redundancy_enabled": redundancy,
+    }
+
+
+def parse_slot_info(r0102):
+    """Extract sender-card link state from an R0102 reply.
+
+    `links` is one decoded entry per connector the reply carries, in index
+    order. A reply with a single top-level `linkstatus` yields one entry at
+    index 0 — that is the shape the vendor's wording implies (one value per
+    sender card), and the per-connector block is handled in case the device
+    answers per port instead.
+
+    The two summary booleans are deliberately conservative: True only if some
+    connector says so outright, False only if every connector that speaks to
+    that axis says otherwise, and None when nothing in the reply addresses it.
+    """
+    if not isinstance(r0102, dict):
+        return None
+
+    block = r0102.get("linkstatus")
+    if isinstance(block, dict):
+        states = []
+        for idx in range(ETHERNET_PORTS_PER_CARD):
+            if f"link{idx}" not in block:
+                break
+            states.append(block[f"link{idx}"])
+    elif isinstance(block, list):
+        states = list(block)
+    elif block is None:
+        states = []
+    else:
+        states = [block]
+
+    links = [dict(decode_link_status(st), index=i)
+             for i, st in enumerate(states)]
+
+    def _summary(key):
+        values = [link[key] for link in links if link[key] is not None]
+        if not values:
+            return None
+        return any(values)
+
+    return {
+        "slot_id": r0102.get("slotId"),
+        "connector_id": r0102.get("connectorId"),
+        "links": links,
+        "cable_connected": _summary("cable_connected"),
+        "redundancy_enabled": _summary("redundancy_enabled"),
+        "raw": r0102,
+    }
+
+
 # ── R0155 reply schemas ────────────────────────────────────────────────────
 #
 # Two different R0155 reply shapes have been seen on real hardware, and both
@@ -689,11 +801,18 @@ def parse_output_links(slot):
 # 0.88 °C on a cold start). The extra centi-only keys act as a backstop for a
 # reply that carries the status block but no voltage field.
 #
-# EVERY scaling below is firmware-dependent and inferred from these two
-# captures alone. Neither is in the published PDF, which documents the R0155
-# *request* but not the reply body. A third firmware could plausibly use a
-# third encoding; if one shows up it needs its own schema, not a tweak to
-# these.
+# SCHEMA_CENTI IS NOW THE DOCUMENTED ONE. NovaStar sent a corrected R0155 field
+# document on 2026-09-04 (shipping with H firmware V2.3.0.0), saying the
+# published version "does indeed lack some information and has unit errors".
+# The corrected page specifies `temp` in units of 0.01 °C (4200 = 42 °C) and
+# `volt` in units of 0.01 V (480 = 4.8 V) — exactly the scalings inferred here.
+# See docs/H_SERIES_FINDINGS.md §6.7.
+#
+# SCHEMA_BYTE is NOT that documentation error. It was captured off real
+# hardware and names its field `voltage`, not `volt`, so it is a genuine second
+# reply shape; its scalings remain inferred from that one capture. A third
+# firmware could plausibly use a third encoding; if one shows up it needs its
+# own schema, not a tweak to these.
 SCHEMA_BYTE = "byte"      # temp / 2 → °C, (voltage & 0x7F) * 0.1 → V
 SCHEMA_CENTI = "centi"    # temp / 100 → °C, volt / 100 → V
 
@@ -744,15 +863,19 @@ def parse_receiving_card(r0155):
     False` and every reading — temperature, voltage, brightness AND both power
     flags — set to None rather than to the placeholder value. Nothing
     downstream may average, max, or alert on a number the device never
-    measured, and `power0Status: 0` on such a card must not read as "primary
-    supply healthy" (the same trap, inverted).
+    measured, and a power flag on such a card must not read as a verdict on a
+    supply in either direction.
 
-    Only `workStatus == 0` (reporting) and `1` (absent/unreachable) have been
-    observed; anything non-zero is treated as not reporting.
+    `workStatus` is vendor-documented as 0 = Normal, 1 = Abnormal, and only
+    those two have been observed; anything non-zero is treated as not
+    reporting.
 
     Returns keys in the shape device_manager already stores per card
     (temp_c / temperature_c / voltage_v / brightness / primary_power_ok /
     backup_power_ok / online) so it can be merged straight into a card entry.
+    `primary_power_ok` / `backup_power_ok` keep those names for compatibility
+    but carry supply 1 and supply 2 — NovaStar's corrected R0155 document names
+    the fields that way, not primary/backup.
     """
     if not isinstance(r0155, dict):
         return None
@@ -793,13 +916,14 @@ def parse_receiving_card(r0155):
         # limit. More authoritative than the app's hardcoded default
         # threshold, though nothing alerts on it yet.
         "temp_limit_c": _maybe_int(r0155.get("tempMax")),
-        # The device's own verdict on each reading, centi schema only.
-        # 0 = OK; 2 is the only other value observed, and only on cards that
-        # were also `workStatus: 1`. The full enum is UNCAPTURED, so any
-        # non-zero is treated as "the device says this reading isn't good"
-        # without claiming to know why. Surfaced, not acted on: a non-zero
-        # status on a card that IS reporting has never been observed, and
-        # suppressing its reading could hide a genuine over-temperature.
+        # The device's own verdict on each reading, centi schema only. The
+        # enum is now vendor-documented (R0155 field doc, 2026-09-04):
+        # 0 = Normal, 1 = Alarm, 2 = Abnormal. Only 0 and 2 have been seen
+        # here, and 2 only on cards that were also `workStatus: 1`.
+        # Any non-zero is treated as "the device says this reading isn't
+        # good". Surfaced, not acted on: a non-zero status on a card that IS
+        # reporting has never been observed, and suppressing its reading could
+        # hide a genuine over-temperature.
         "temp_status": _maybe_int(r0155.get("tempStatus")),
         "volt_status": _maybe_int(r0155.get("voltStatus")),
         "temp_status_ok": _status_ok(r0155.get("tempStatus")),
@@ -833,13 +957,12 @@ def parse_receiving_card(r0155):
         "voltage_v": volt_v,
         "voltage_raw": volt_raw,
         "brightness": r0155.get("brightness"),
-        # Power status: 0 = OK, non-zero = fault (power0 = primary supply,
-        # power1 = backup). The polarity is INFERRED, not documented — it is
-        # consistent with the live wall (present cards were mostly 0,0) but
-        # one card that was plainly working reported 1,1, so a non-zero value
-        # is not proof of a failed supply. Only ever evaluated for a card that
-        # is actually reporting, so a non-reporting card's placeholder 0,0
-        # can never be read as "both supplies healthy".
+        # Power status: vendor-documented 0 = Fault, 1 = Normal, for receiving
+        # card power supply 1 (power0Status) and supply 2 (power1Status). Only
+        # 1 is trusted; 0 reads as unknown rather than as a fault, because most
+        # of a healthy wall reports it. See _power_status for why. Only ever
+        # evaluated for a card that is actually reporting, so a non-reporting
+        # card's placeholder zeros claim nothing at all.
         "primary_power_ok": _power_status(r0155.get("power0Status"), True),
         "backup_power_ok": _power_status(r0155.get("power1Status"), True),
         # The raw fields, kept so the meaning can be settled later without
@@ -853,9 +976,14 @@ def parse_receiving_card(r0155):
 def decode_temp_centi(v):
     """Centi-schema temp → °C: value / 100.
 
-    From the live H-series capture: `temp` 3600–3800 across reporting cards →
-    36.0–38.0 °C, which matches a wall running normally. The same values under
-    the byte schema's `/2` would be 1800–1900 °C.
+    Vendor-documented. NovaStar's corrected R0155 field document (2026-09-04):
+    "Temperature value, in units of 0.01 degrees Celsius; for example, a value
+    of 4200 represents a temperature of 42 degrees Celsius."
+
+    Independently consistent with the live H-series capture that this decode
+    was originally derived from: `temp` 3600–3800 across reporting cards →
+    36.0–38.0 °C, matching a wall running normally. The same values under the
+    byte schema's `/2` would be 1800–1900 °C.
     """
     if v is None:
         return None
@@ -868,9 +996,13 @@ def decode_temp_centi(v):
 def decode_volt_centi(v):
     """Centi-schema volt → V: value / 100.
 
-    From the same capture: `volt` 410–440 on reporting cards → 4.10–4.40 V.
-    Cards that were not reporting (`workStatus: 1`) all read 0, which is a
-    placeholder and never reaches this function.
+    Vendor-documented. NovaStar's corrected R0155 field document (2026-09-04):
+    "Voltage value, in units of 0.01V; for example, a value of 480 represents a
+    voltage of 4.8V."
+
+    Agrees with the capture this was derived from: `volt` 410–440 on reporting
+    cards → 4.10–4.40 V. Cards that were not reporting (`workStatus: 1`) all
+    read 0, which is a placeholder and never reaches this function.
     """
     if v is None:
         return None
@@ -954,25 +1086,36 @@ def _status_ok(v):
 def _power_status(v, reporting):
     """`powerNStatus` → True (healthy) / None (unknown). Never False.
 
-    `0 = healthy, non-zero = failed` was inferred from captures, and the live
-    wall disproved the second half of it. Fifteen cards reported
-    `power0Status: 1` AND `power1Status: 1` while simultaneously reporting
-    41-42 °C and 4.0-4.1 V. A card cannot measure and transmit its own
-    temperature through a failed primary supply — it is powered and talking.
-    Read as "both supplies failed" it produced a warning every polling cycle
-    on a wall that was lit and healthy.
+    POLARITY: **0 = Fault, 1 = Normal.** Documented by NovaStar twice — in the
+    H Series Control Protocol §4.3.4 and again in the corrected R0155 field
+    document of 2026-09-04, which also renames the fields: these are power
+    supply **1 and 2**, not primary and backup.
 
-    So non-zero on a REPORTING card is not a supply failure. What it actually
-    means is not known: most likely a PSU that is not fitted or not monitored
-    on that panel model, since panels with a single supply still have two
-    status fields. Until NovaStar confirms it (see
-    docs/NOVASTAR_PROTOCOL_QUESTIONS.md), the honest answer is None — unknown
-    — and nothing alerts on it.
+    This project had it backwards for a long time, and the mistake is worth
+    remembering because the evidence looked like it pointed the other way.
+    Fifteen cards reported `power0Status: 1` AND `power1Status: 1` while
+    reporting 41-42 °C and 4.0-4.1 V. That was read as "both supplies failed on
+    a card that is plainly running, so 1 can't mean failed" — a sound
+    observation attached to a backwards conclusion. Under the documented
+    polarity those cards were reporting two healthy supplies all along.
 
-    `0` is still taken as healthy, but only from a reporting card: on a
-    non-reporting one every field is a placeholder, and a placeholder zero
-    read as "supply healthy" is the same trap inverted.
+    The mapping is deliberately asymmetric, because the OTHER direction is
+    still unexplained: 21 of 36 cards on the 286-panel wall report 0 on both
+    fields while lit and answering. Read literally that is a double supply
+    failure on hardware that is working. Almost certainly it means a supply
+    that is not fitted or not monitored — these panels are single-supply — but
+    NovaStar has not confirmed it, so:
+
+        1  → True   healthy, vendor-documented Normal
+        0  → None   documented Fault, but seen across most of a healthy wall
+
+    Nothing alerts on either value. Returning False for 0 would put a critical
+    supply fault on the majority of a working wall.
+
+    Both readings are only ever evaluated for a REPORTING card. On a
+    non-reporting one every field is a placeholder, and a placeholder is not a
+    measurement in either direction.
     """
     if v is None or not reporting:
         return None
-    return True if v == 0 else None
+    return True if v == 1 else None

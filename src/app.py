@@ -552,17 +552,25 @@ def _card_breaches(cards, settings):
         #     The Wall View paints that amber "suspect", and this is a WARNING
         #     for the same reason — nobody should be paged at 3am for a
         #     dropped packet.
-        # Neither reported (both None, e.g. the binary path, or a card that
-        # is not reporting) → nothing to say. That last case matters: a
-        # non-reporting card sends `power0Status: 0, power1Status: 0`, and
-        # reading that as "both supplies healthy" is the same placeholder trap
-        # as reading its 0 V as a dead rail, just inverted. The parser hands
-        # such a card None/None precisely so it lands here.
+        # Neither reported (both None) → nothing to say. That case matters: a
+        # non-reporting card fills every field with placeholders, and reading
+        # a placeholder flag as a verdict on a supply is the same trap as
+        # reading its 0 V as a dead rail. The parser hands such a card
+        # None/None precisely so it lands here.
         #
-        # The 0 = OK polarity itself is INFERRED from the live wall (present
-        # cards were mostly 0,0), not documented — and one card that was
-        # plainly working reported 1,1, so a flagged supply is a prompt to go
-        # look, not proof of a failure.
+        # ⚠ NOTHING BELOW FIRES ON LIVE DATA TODAY, and that is deliberate.
+        # NovaStar documents the flags as 0 = Fault / 1 = Normal, but 21 of 36
+        # cards on the operator's lit wall report 0 on BOTH supplies, so
+        # `_power_status` refuses to call 0 a fault and returns only True or
+        # None — never False. These branches are reachable only from an older
+        # snapshot, and the snapshot loader now clears those too
+        # (`_drop_stale_power_flags`).
+        #
+        # They stay, unmodified, because the day NovaStar explains what 0
+        # means on a card that is plainly running, this is the policy that
+        # should apply — and the tests below pin that policy so it cannot rot
+        # while it is dormant. Do not read their passing as evidence that
+        # per-card power alerting is currently live; it is not.
         #
         # These are booleans, not readings, so `value` stays None; `_worst`
         # handles a group with nothing rankable in it.
@@ -1650,6 +1658,35 @@ _snapshot_cache = {}
 _snapshot_cache_lock = threading.Lock()
 
 
+def _drop_stale_power_flags(data):
+    """Clear `False` receiving-card supply flags out of a loaded snapshot.
+
+    No decoder in this project can produce `False` for `primary_power_ok` or
+    `backup_power_ok` — `h_series_json._power_status` returns only True or
+    None. Any `False` in a snapshot was therefore written by an older parser
+    working from the inverted polarity (it read `0` as healthy and non-zero as
+    failed; NovaStar has since documented 0 = Fault, 1 = Normal).
+
+    That mattered visibly: `enumerate_wall.attach_readings` merges only
+    non-None readings, so a stale `False` survives every subsequent read, and
+    the Wall View paints those cards red for a supply fault that no live
+    reading claims. Fifteen cards on the stored 286-panel snapshot were doing
+    exactly that.
+
+    Cleared to None — unknown — rather than to True. The card's real supply
+    state is whatever the next read says; until then nothing is claimed.
+    Mutates in place, before the snapshot is cached.
+    """
+    if not isinstance(data, dict):
+        return
+    for card in (data.get('cards') or []):
+        if not isinstance(card, dict):
+            continue
+        for key in ('primary_power_ok', 'backup_power_ok'):
+            if card.get(key) is False:
+                card[key] = None
+
+
 def load_wall_snapshot(path=None):
     """Return (snapshot, mtime_iso) for the enumeration snapshot.
 
@@ -1675,6 +1712,8 @@ def load_wall_snapshot(path=None):
     except Exception:
         logger.exception('Failed to load wall live snapshot from %s', path)
         return None, None
+
+    _drop_stale_power_flags(data)
 
     mtime_iso = datetime.fromtimestamp(stat.st_mtime).isoformat()
     with _snapshot_cache_lock:

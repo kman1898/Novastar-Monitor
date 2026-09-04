@@ -57,7 +57,8 @@ class StubJSONClient:
     assert on.
     """
 
-    def __init__(self, responses=None, screen_list=None, brightness=None):
+    def __init__(self, responses=None, screen_list=None, brightness=None,
+                 slot_info=None):
         # {(slot, port, card_id): r0155_response_dict}
         self.responses = responses or {}
         self.batch_calls = []
@@ -65,11 +66,17 @@ class StubJSONClient:
         self.commands = []
         self.screen_list = screen_list
         self.brightness = brightness
+        # {slot_id: r0102_response_dict}
+        self.slot_info = slot_info or {}
         self.closed = False
 
     def get_device_details(self, device_id=0):
         self.commands.append("R0100")
         return {"cmd": "R0100", "slotList": []}
+
+    def get_slot_info(self, slot_id, port_id=0, connector_id=0):
+        self.commands.append("R0102")
+        return self.slot_info.get(slot_id)
 
     def get_screen_list(self):
         self.commands.append("R0400")
@@ -826,9 +833,22 @@ class TestOnDemandCardRefresh:
         card = dev.refresh_all_cards()[0]
         assert card["temp_c"] == 44.0
         assert card["temperature_c"] == 44.0
+        # The capture this fixture reproduces reports 0 on both supplies.
+        # Vendor-documented that is Fault, but most of a lit wall says it, so
+        # it reaches the card as unknown rather than as a fault.
+        assert card["primary_power_ok"] is None
+        assert card["backup_power_ok"] is None
+        assert card["brightness"] == 127
+
+    def test_a_healthy_power_flag_reaches_the_card(self):
+        """1 is the vendor's Normal value, and it must survive the trip from
+        the R0155 reply to the stored card entry."""
+        reply = dict(_r0155(temp=88), power0Status=1, power1Status=1)
+        client = StubJSONClient({(20, 0, 0): reply})
+        dev = _h_device(client, [{"slot": 20, "port": 0, "card_id": 0}])
+        card = dev.refresh_all_cards()[0]
         assert card["primary_power_ok"] is True
         assert card["backup_power_ok"] is True
-        assert card["brightness"] == 127
 
     def test_silent_card_is_unknown_and_keeps_identity(self):
         client = StubJSONClient({})   # device answers nothing
@@ -2222,18 +2242,19 @@ class TestSenderLinkMedium:
                   'linkstatus': {f'link{i}': 0 for i in range(16)}}
 
     class _Client(StubJSONClient):
-        def __init__(self, slots):
-            super().__init__(screen_list={"screens": [{"screenId": 0}]})
+        def __init__(self, slots, slot_info=None):
+            super().__init__(screen_list={"screens": [{"screenId": 0}]},
+                             slot_info=slot_info)
             self._slots = slots
 
         def get_device_details(self, device_id=0):
             self.commands.append("R0100")
             return {"cmd": "R0100", "slotList": self._slots}
 
-    def _dev(self, slots):
+    def _dev(self, slots, slot_info=None):
         snmp = StubSNMPMonitor(health=snmp_health(), screens=snmp_screens(),
                                output=snmp_output())
-        client = self._Client(slots)
+        client = self._Client(slots, slot_info=slot_info)
         dev = _h_device(client, snmp=snmp)
         dev.poll()
         return dev, client
@@ -2243,6 +2264,34 @@ class TestSenderLinkMedium:
         links = dev.state["sender_links"]
         assert links[20]["medium"] == "opt"
         assert links[22]["medium"] == "ethernet"
+
+    def test_r0102_link_status_lands_on_the_slot(self):
+        """NovaStar's answer for detecting primary/backup switching: R0102
+        carries the sender card's linkstatus, 0 not connected / 1 connected /
+        2 redundancy not set / 3 redundancy enabled."""
+        dev, _ = self._dev(
+            [self.OPT_SLOT, self.ETH_SLOT],
+            slot_info={20: {"cmd": "R0102", "slotId": 20, "linkstatus": 3},
+                       22: {"cmd": "R0102", "slotId": 22, "linkstatus": 1}})
+        links = dev.state["sender_links"]
+        assert links[20]["slot_link_status"]["redundancy_enabled"] is True
+        assert links[22]["slot_link_status"]["cable_connected"] is True
+        # It rides alongside the medium rather than replacing it.
+        assert links[20]["medium"] == "opt"
+
+    def test_a_slot_that_does_not_answer_r0102_gets_no_key(self):
+        """Absent must stay distinguishable from 'reported down'."""
+        dev, _ = self._dev([self.OPT_SLOT], slot_info={})
+        assert "slot_link_status" not in dev.state["sender_links"][20]
+
+    def test_r0102_is_read_with_the_topology_not_the_poll(self):
+        dev, client = self._dev(
+            [self.OPT_SLOT],
+            slot_info={20: {"cmd": "R0102", "slotId": 20, "linkstatus": 1}})
+        assert "R0102" in client.commands
+        client.commands.clear()
+        dev.poll()
+        assert "R0102" not in client.commands
 
     def test_input_cards_are_not_recorded_as_senders(self):
         """Input cards carry link blocks too and they mean something else."""

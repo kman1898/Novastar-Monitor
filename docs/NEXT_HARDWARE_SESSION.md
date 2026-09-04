@@ -45,6 +45,28 @@ a populated chain goes quiet at roughly the same count, the limit counts
 requests; if it survives, it counts cards actually reached. That decides
 whether our pacing can be smarter.
 
+**7. R0102 `linkstatus` — the new one, and the most important read here.**
+NovaStar's answer of 2026-09-04 to "how do we detect primary/backup switching":
+R0102 carries the sender card's `linkstatus`, 0 = cable not connected,
+1 = connected, 2 = redundancy not set, 3 = redundancy enabled. It is wired up
+(`h_series_json.parse_slot_info`, stored per slot as `slot_link_status`) but
+**no R0102 reply has ever been captured**, so three things need confirming:
+
+- **The reply shape.** Is `linkstatus` a single value per card, or a
+  `{link0..linkN}` block per connector? The parser handles both, but the
+  device_manager only asks for connector 0. If it turns out to be
+  per-connector, `_refresh_slot_link_status` needs a 0..3 sweep.
+- **Does 3 mean redundancy is CONFIGURED or currently CARRYING the load?**
+  Those are different answers to "are we on backup right now" and the vendor's
+  wording does not decide it. Read it on a healthy wall, then pull a cable and
+  read it again — if the value moves, it is live state; if it doesn't, it is
+  configuration and the failover answer is still the bit-error signature.
+- **Whether it is the same field as R0100's `linkstatus`.** If it is, then
+  `parse_output_links`'s `up = bool(state)` is wrong: it would be reading
+  "redundancy not set" (2) as "port up". R0100's blocks correlated exactly with
+  the physical wiring on all four cards, which argues they are different
+  fields, but that was never checked against this encoding.
+
 ## Also worth doing while connected
 
 - **Re-run the wall enumeration.** `python3 src/enumerate_wall.py 192.168.0.10
@@ -60,20 +82,32 @@ whether our pacing can be smarter.
 
 ## Open questions with NovaStar
 
+**Answered 2026-09-04** — the three that had been at the top of this list. See
+`docs/H_SERIES_FINDINGS.md` §6.7 for the detail:
+
+1. ~~Which firmware introduced the R0155 reply we actually get?~~ The published
+   R0155 page had unit errors. The corrected one documents exactly the reply
+   this hardware sends — temp in 0.01 °C, volt in 0.01 V. Ships with H V2.3.0.0.
+2. ~~How do we tell whether a chain has failed over?~~ R0102 `linkstatus`,
+   0/1/2/3. Implemented, unverified — see item 7 above.
+3. ~~A rate limit, or a bulk read?~~ Customized firmware reading over **TCP port
+   7000**, with batch processing and large data packets, folding into V2.3.0.0.
+
 Still waiting on:
 
-1. The R0155 reply this firmware sends (`workStatus`, `temp: 3700`,
-   `volt: 440`, `mcuVersion`...) is in NEITHER V1.0.18 nor V1.0.20 of the
-   control protocol. Which firmware introduced it, and is it documented?
-2. Any way to tell which sender card is currently feeding a receiving card, or
-   whether a chain has failed over. **This is the one that matters most** — a
-   break with a working backup leaves every panel lit and answering.
-3. A documented rate limit, or a bulk read that returns a whole chain.
-4. What `status` means on `.1.17`, given `iSignal` is the power field.
-5. What `byte[12]` = `0x0B` means in the live-monitoring reply (0x01 on 162
+1. What `status` means on `.1.17`, given `iSignal` is the power field.
+2. What `byte[12]` = `0x0B` means in the live-monitoring reply (0x01 on 162
    cards, 0x0B on 124, all healthy).
+3. **Why 21 of 36 lit, answering cards report `power0Status: 0` AND
+   `power1Status: 0`.** The polarity is settled — 0 is Fault — so read
+   literally that is a double supply failure on hardware that is working.
+   Almost certainly "not fitted / not monitored" on a single-supply panel, but
+   until it is confirmed nothing can alert on a supply flag at all.
+4. How to obtain the customized V2.3.0.0 firmware, and whether the port 7000
+   batch format will be documented. Nothing is implemented for it — port 7000
+   has never been seen on the wire here.
 
-Draft reply to their last message: `docs/NOVASTAR_REPLY_2.md`.
+Draft reply to their last message: `docs/NOVASTAR_REPLY_3.md`.
 Full question list: `docs/NOVASTAR_PROTOCOL_QUESTIONS.md`.
 
 ## Things NOT to repeat
